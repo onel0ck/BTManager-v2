@@ -1,0 +1,16 @@
+# Bittensor Manager v2 Configuration
+
+# RPC endpoints
+rpc_endpoint: "wss://entrypoint-finney.opentensor.ai:443"
+fallback_endpoints:
+  - "wss://lite.finney.opentensor.ai:443"
+
+# Wallet settings
+wallet:
+  base_path: "~/.bittensor/wallets"
+  default_coldkey: ""
+
+# Display settings
+display:
+  hide_zero_stake: true
+  show_usd_prices: true

@@ -1,0 +1,5 @@
+async-substrate-interface>=1.0.0
+bittensor-wallet>=2.0.0
+rich>=13.0.0
+pyyaml>=6.0
+aiohttp>=3.9.0
