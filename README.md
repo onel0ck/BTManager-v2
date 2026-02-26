@@ -56,17 +56,10 @@ wallet:
 ## Wallet Selection
 
 When prompted to select wallets, you can use:
-- Wallet name: `114_1`
+- Wallet name: `wallet_1`
 - Number from list: `1`
-- Multiple: `1,3,5` or `114_1,114_2`
+- Multiple: `1,3,5` or `wallet_1,wallet_2`
 - All wallets: `all`
-
-## Requirements
-
-- Python 3.10+
-- `async-substrate-interface` — direct chain connection (no bittensor SDK needed)
-- `bittensor-wallet` — wallet key management
-- `rich` — terminal UI
 
 ## License
 
