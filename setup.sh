@@ -21,16 +21,3 @@ echo "Installing dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-echo ""
-echo "═══════════════════════════════════════"
-echo "  Setup complete!"
-echo "═══════════════════════════════════════"
-echo ""
-echo "To run:"
-echo "  source venv/bin/activate"
-echo "  python main.py"
-echo ""
-echo "To test connection first:"
-echo "  python test_client.py"
-echo "  python test_client.py --address YOUR_SS58_ADDRESS"
-echo ""
