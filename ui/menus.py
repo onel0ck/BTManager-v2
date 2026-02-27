@@ -230,6 +230,13 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
         return
 
     show_usd = config.get("display", {}).get("show_usd_prices", True)
+
+    # Build global neuron cache once (all subnets, ~10s)
+    console.print("  [dim]Loading neuron data from all subnets...[/dim]")
+    from core.stats import build_global_neuron_cache
+    neuron_cache = await build_global_neuron_cache(client)
+    console.print(f"  [dim]Cached {len(neuron_cache)} hotkeys[/dim]")
+
     all_stats = []
     for w in selected:
         addr = get_coldkey_ss58(w["name"], base_path)
@@ -237,7 +244,22 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
             print_warn(f"Could not load address for {w['name']}")
             continue
         console.print(f"  Loading stats for [cyan]{w['name']}[/cyan]...")
-        stats = await get_wallet_stats(client, addr, include_usd=show_usd)
+
+        # Load hotkey SS58 addresses for registration checks
+        hotkey_ss58_list = []
+        from bittensor_wallet import Wallet
+        for hk_name in (w.get("hotkeys") or []):
+            try:
+                hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
+                hotkey_ss58_list.append(hw.hotkey.ss58_address)
+            except Exception:
+                pass
+
+        stats = await get_wallet_stats(
+            client, addr, include_usd=show_usd,
+            hotkey_ss58_list=hotkey_ss58_list,
+            neuron_cache=neuron_cache,
+        )
         all_stats.append((w["name"], stats))
 
     if all_stats:

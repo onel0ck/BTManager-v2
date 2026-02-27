@@ -362,6 +362,61 @@ class SubstrateClient:
             logger.error(f"Failed to get neurons for subnet {netuid}: {e}")
             return []
 
+    async def get_uid_for_hotkey_on_subnet(self, netuid: int, hotkey_ss58: str):
+        """Check if hotkey is registered on subnet via Uids storage. Returns uid or None."""
+        self._ensure_connected()
+        try:
+            result = await self.substrate.query(
+                module="SubtensorModule",
+                storage_function="Uids",
+                params=[netuid, hotkey_ss58],
+            )
+            val = result.value if hasattr(result, "value") else result
+            if val is not None:
+                return int(val)
+            return None
+        except Exception:
+            return None
+
+    async def get_registered_subnets_for_hotkeys(
+        self, hotkey_ss58_list: list[str], netuids: list[int]
+    ) -> dict:
+        """
+        For each hotkey, find which subnets it's registered on.
+        Returns: {hotkey_ss58: [(netuid, uid), ...]}
+        """
+        self._ensure_connected()
+        result_map = {hk: [] for hk in hotkey_ss58_list}
+
+        tasks = []
+        task_keys = []
+        for hk in hotkey_ss58_list:
+            for netuid in netuids:
+                tasks.append(self.get_uid_for_hotkey_on_subnet(netuid, hk))
+                task_keys.append((hk, netuid))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for (hk, netuid), res in zip(task_keys, results):
+            if isinstance(res, Exception) or res is None:
+                continue
+            result_map[hk].append((netuid, res))
+
+        return result_map
+
+    async def get_neuron_info_for_uid(self, netuid: int, uid: int):
+        """Get neuron lite info for a specific uid on a subnet."""
+        self._ensure_connected()
+        try:
+            result = await self.substrate.runtime_call(
+                api="NeuronInfoRuntimeApi",
+                method="get_neuron_lite",
+                params=[netuid, uid],
+            )
+            data = result.value if hasattr(result, "value") else result
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
     # ========================================================================
     # Block info
     # ========================================================================

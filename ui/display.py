@@ -7,6 +7,8 @@ from rich.table import Table
 
 console = Console()
 
+BLOCKS_PER_DAY = 7200
+
 
 def print_header(text: str):
     console.print(f"\n[bold cyan]{'═' * 60}[/bold cyan]")
@@ -54,7 +56,6 @@ def display_balance_table(balances: list[dict], tao_price: float = None):
             row.append(f"${total * tao_price:,.2f}")
         table.add_row(*row)
 
-    # Total row
     grand = total_free + total_staked
     total_row = ["[bold]TOTAL[/bold]", "", f"[bold]{total_free:.6f}[/bold]",
                  f"[bold]{total_staked:.6f}[/bold]", f"[bold]{grand:.6f}[/bold]"]
@@ -84,36 +85,59 @@ def display_wallet_stats(stats: dict, wallet_name: str = ""):
             f"(TAO = ${tao_price:.2f})"
         )
 
+    # Per-wallet daily emission summary
+    em_per_blk = stats.get("total_emission_tao_per_block", 0.0)
+    if em_per_blk > 0 and tao_price:
+        daily_tao = em_per_blk * BLOCKS_PER_DAY
+        daily_usd = daily_tao * tao_price
+        console.print(
+            f"[bold]Daily Emission:[/bold] [magenta]{daily_tao:.4f} τ/day[/magenta]"
+            f" [bold green](${daily_usd:,.2f}/day)[/bold green]"
+        )
+
     if stats["subnets"]:
-        table = Table(title="Subnet Stakes", show_lines=True)
+        table = Table(title="Registered Subnets", show_lines=True)
         table.add_column("SN", style="cyan", justify="right")
         table.add_column("Name", style="white")
         table.add_column("Hotkey", style="dim", no_wrap=True)
-        table.add_column("Alpha Stake", justify="right", style="yellow")
-        table.add_column("TAO Value", justify="right", style="green")
+        table.add_column("UID", style="white", justify="right")
+        table.add_column("α Stake", justify="right", style="yellow")
+        table.add_column("τ Value", justify="right", style="green")
         if tao_price:
             table.add_column("USD", justify="right", style="yellow")
-        table.add_column("Emission", justify="right", style="magenta")
+        table.add_column("τ/day", justify="right", style="magenta")
+        if tao_price:
+            table.add_column("$/day", justify="right", style="bold green")
+        table.add_column("Inc", justify="right", style="blue")
         table.add_column("Reg", justify="center")
 
         for s in stats["subnets"]:
             hk = str(s["hotkey"])
             reg = "✓" if s["is_registered"] else "✗"
+            uid_str = str(s["uid"]) if s.get("uid") is not None else "-"
+            inc = s.get("incentive", 0)
+            inc_str = f"{inc/65535*100:.1f}%" if inc else "0"
+            em_per_block = s.get("emission", 0)
+            daily_tao = em_per_block * BLOCKS_PER_DAY
             row = [
                 str(s["netuid"]),
                 s["subnet_name"],
                 hk,
+                uid_str,
                 f"{s['alpha_stake']:.4f}",
                 f"{s['tao_value']:.4f}",
             ]
             if tao_price:
                 row.append(f"${s['tao_value'] * tao_price:,.2f}")
-            row.extend([f"{s['emission']:.6f}", reg])
+            row.append(f"{daily_tao:.6f}")
+            if tao_price:
+                row.append(f"${daily_tao * tao_price:,.2f}")
+            row.extend([inc_str, reg])
             table.add_row(*row)
 
         console.print(table)
     else:
-        console.print("  [dim]No stakes found[/dim]")
+        console.print("  [dim]No registrations found[/dim]")
 
 
 def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
@@ -121,6 +145,7 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
     grand_free = 0.0
     grand_staked = 0.0
     grand_total = 0.0
+    grand_emission_per_block = 0.0
     tao_price = None
 
     for name, stats in all_stats:
@@ -128,6 +153,7 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
         grand_free += stats["free_balance_tao"]
         grand_staked += stats["total_staked_tao"]
         grand_total += stats["total_value_tao"]
+        grand_emission_per_block += stats.get("total_emission_tao_per_block", 0.0)
         if stats.get("tao_price_usd"):
             tao_price = stats["tao_price_usd"]
         console.print()
@@ -140,6 +166,14 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
         console.print(f"  Total: [bold green]{grand_total:.4f}[/bold green] TAO")
         if tao_price:
             console.print(f"  USD: [bold green]${grand_total * tao_price:,.2f}[/bold green] (TAO = ${tao_price:.2f})")
+        if grand_emission_per_block > 0:
+            daily_tao = grand_emission_per_block * BLOCKS_PER_DAY
+            console.print(f"  Daily Emission: [bold magenta]{daily_tao:.4f} τ/day[/bold magenta]", end="")
+            if tao_price:
+                daily_usd = daily_tao * tao_price
+                console.print(f" [bold green](${daily_usd:,.2f}/day)[/bold green]")
+            else:
+                console.print()
 
 
 def display_subnet_overview(info: dict, tao_price: float = None):
