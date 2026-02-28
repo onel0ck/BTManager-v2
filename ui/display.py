@@ -175,6 +175,19 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
             else:
                 console.print()
 
+        # Subnet registration summary
+        subnet_reg_count = {}  # {(netuid, name): count}
+        for _, stats in all_stats:
+            for s in stats.get("subnets", []):
+                if s.get("is_registered"):
+                    key = (s["netuid"], s["subnet_name"])
+                    subnet_reg_count[key] = subnet_reg_count.get(key, 0) + 1
+        if subnet_reg_count:
+            total_reg = sum(subnet_reg_count.values())
+            console.print(f"  [bold]Registrations ({total_reg} total):[/bold]")
+            for (netuid, name), count in sorted(subnet_reg_count.items()):
+                console.print(f"    SN{netuid} {name}: [cyan]{count}[/cyan] hotkeys")
+
 
 def display_subnet_overview(info: dict, tao_price: float = None):
     """Display subnet overview."""
