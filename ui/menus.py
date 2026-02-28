@@ -511,27 +511,80 @@ async def handle_unstake(client: SubstrateClient, config: dict):
             return
 
         total_hotkeys = sum(len(hks) for _, _, hks in unstake_plan)
-        console.print(f"\n  Total: [yellow]{total_hotkeys} hotkeys[/yellow] across [yellow]{len(unstake_plan)} wallets[/yellow]")
+        total_wallets = len(unstake_plan)
+        console.print(f"\n  Total: [yellow]{total_hotkeys} hotkeys[/yellow] across [yellow]{total_wallets} wallets[/yellow]")
+
+        # Mode selection
+        if total_wallets > 1:
+            console.print("\n  [cyan]A.[/cyan] Sequential (one tx at a time, safe)")
+            console.print("  [cyan]B.[/cyan] Parallel coldkeys (different wallets in same block, faster)")
+            mode = Prompt.ask("Mode", choices=["A", "B", "a", "b"], default="B").upper()
+        else:
+            mode = "A"
+
         if not Confirm.ask("Unstake all?"):
             return
 
-        # Execute
-        for w, addr, staked_hotkeys in unstake_plan:
-            console.print(f"\n  [cyan]{w['name']}[/cyan] ({len(staked_hotkeys)} hotkeys)")
-            wallet = load_wallet(w["name"], base_path=base_path)
-            console.print("  [dim]Unlocking coldkey...[/dim]")
-            _ = wallet.coldkey
+        if mode == "A":
+            # Sequential: one by one
+            for w, addr, staked_hotkeys in unstake_plan:
+                console.print(f"\n  [cyan]{w['name']}[/cyan] ({len(staked_hotkeys)} hotkeys)")
+                wallet = load_wallet(w["name"], base_path=base_path)
+                console.print("  [dim]Unlocking coldkey...[/dim]")
+                _ = wallet.coldkey
 
-            for hk_ss58 in staked_hotkeys:
-                console.print(f"  Unstaking {hk_ss58[:16]}...")
-                try:
-                    success, error = await unstake_all(client, wallet, hk_ss58)
+                for hk_ss58 in staked_hotkeys:
+                    console.print(f"  Unstaking {hk_ss58[:16]}...")
+                    try:
+                        success, error = await unstake_all(client, wallet, hk_ss58)
+                        if success:
+                            print_success(f"Unstaked {hk_ss58[:16]}...")
+                        else:
+                            print_error(f"{hk_ss58[:16]}: {error}")
+                    except Exception as e:
+                        print_error(f"{hk_ss58[:16]}: {e}")
+        else:
+            # Parallel: different coldkeys run concurrently
+            # Hotkeys within same coldkey stay sequential (same nonce source)
+            console.print("\n  [dim]Unlocking all coldkeys...[/dim]")
+            wallet_plans = []
+            for w, addr, staked_hotkeys in unstake_plan:
+                wallet = load_wallet(w["name"], base_path=base_path)
+                _ = wallet.coldkey  # unlock
+                wallet_plans.append((w["name"], wallet, list(staked_hotkeys)))
+
+            console.print(f"  [dim]Starting parallel unstake ({total_wallets} wallets)...[/dim]")
+
+            async def unstake_wallet(name, wallet, hotkeys):
+                results = []
+                for hk_ss58 in hotkeys:
+                    try:
+                        success, error = await unstake_all(client, wallet, hk_ss58)
+                        results.append((name, hk_ss58, success, error))
+                    except Exception as e:
+                        results.append((name, hk_ss58, False, str(e)))
+                return results
+
+            tasks = [unstake_wallet(name, w, hks) for name, w, hks in wallet_plans]
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Display results
+            ok_count = 0
+            fail_count = 0
+            for result in all_results:
+                if isinstance(result, Exception):
+                    print_error(f"Wallet task failed: {result}")
+                    fail_count += 1
+                    continue
+                for name, hk_ss58, success, error in result:
                     if success:
-                        print_success(f"Unstaked {hk_ss58[:16]}...")
+                        print_success(f"{name}: unstaked {hk_ss58[:16]}...")
+                        ok_count += 1
                     else:
-                        print_error(f"{hk_ss58[:16]}: {error}")
-                except Exception as e:
-                    print_error(f"{hk_ss58[:16]}: {e}")
+                        print_error(f"{name}: {hk_ss58[:16]} - {error}")
+                        fail_count += 1
+
+            console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
 
     elif choice == "2":
         w = select_single_wallet(base_path)
