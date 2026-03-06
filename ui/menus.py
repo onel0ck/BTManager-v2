@@ -1,3 +1,4 @@
+
 """
 Interactive menu system using Rich.
 """
@@ -103,31 +104,31 @@ def select_single_wallet(base_path: str, prompt: str = "Select wallet") -> dict 
     return result[0] if result else None
 
 
-def select_hotkey(wallet: dict) -> str | None:
+def select_hotkey(wallet: dict) -> list[str] | None:
     hotkeys = wallet.get("hotkeys", [])
     if not hotkeys:
         print_warn(f"No hotkeys for {wallet['name']}")
         return None
     if len(hotkeys) == 1:
-        return hotkeys[0]
+        return hotkeys
 
     console.print(f"\n  Hotkeys for [cyan]{wallet['name']}[/cyan] ({len(hotkeys)} total):")
-    for i, hk in enumerate(hotkeys, 1):
-        console.print(f"    {i}. {hk}")
+    for hk in hotkeys:
+        console.print(f"    {hk}")
 
-    user_input = Prompt.ask("Select hotkey (name, #, or 'all')")
+    user_input = Prompt.ask("Select hotkey (name, comma-separated, or 'all')")
     if user_input.lower() == "all":
-        return "all"
-    if user_input in hotkeys:
-        return user_input
-    try:
-        idx = int(user_input)
-        if 1 <= idx <= len(hotkeys):
-            return hotkeys[idx - 1]
-    except ValueError:
-        pass
-    print_error("Invalid hotkey selection")
-    return None
+        return hotkeys
+
+    parts = [p.strip() for p in user_input.split(",") if p.strip()]
+    result = []
+    for part in parts:
+        if part in hotkeys:
+            result.append(part)
+        else:
+            print_error(f"Hotkey '{part}' not found")
+            return None
+    return result if result else None
 
 
 # ========================================================================
@@ -278,11 +279,11 @@ async def handle_register(client: SubstrateClient, config: dict):
     if not w:
         return
 
-    hk_name = select_hotkey(w)
-    if not hk_name:
+    hk_names = select_hotkey(w)
+    if not hk_names:
         return
 
-    hotkey_names = w["hotkeys"] if hk_name == "all" else [hk_name]
+    hotkey_names = hk_names
     netuid = IntPrompt.ask("Subnet ID (netuid)")
 
     info = await get_registration_info(client, netuid)
@@ -590,11 +591,11 @@ async def handle_unstake(client: SubstrateClient, config: dict):
         w = select_single_wallet(base_path)
         if not w:
             return
-        hk_name = select_hotkey(w)
-        if not hk_name:
+        hk_names = select_hotkey(w)
+        if not hk_names:
             return
         netuid = IntPrompt.ask("Subnet ID (netuid)")
-        hotkey_names = w["hotkeys"] if hk_name == "all" else [hk_name]
+        hotkey_names = hk_names
 
         wallet_obj = None
         for hk in hotkey_names:
@@ -618,10 +619,11 @@ async def handle_unstake(client: SubstrateClient, config: dict):
         w = select_single_wallet(base_path)
         if not w:
             return
-        hk_name = select_hotkey(w)
-        if not hk_name or hk_name == "all":
-            print_error("Select a specific hotkey for partial unstake")
+        hk_names = select_hotkey(w)
+        if not hk_names or len(hk_names) > 1:
+            print_error("Select exactly one hotkey for partial unstake")
             return
+        hk_name = hk_names[0]
         wallet = load_wallet(w["name"], hk_name, base_path)
         hotkey_ss58 = wallet.hotkey.ss58_address
         netuid = IntPrompt.ask("Subnet ID (netuid)")
