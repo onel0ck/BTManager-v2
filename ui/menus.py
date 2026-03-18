@@ -514,15 +514,63 @@ async def _transfer_collect(client, base_path):
     if not Confirm.ask("Proceed with collect?"):
         return
 
+    # Unlock all coldkeys first
+    console.print("  [dim]Unlocking all coldkeys...[/dim]")
+    wallet_plans = []
     for w, addr, amount in send_list:
-        console.print(f"  Collecting from {w['name']}...")
         wallet = load_wallet(w["name"], base_path=base_path)
-        _ = wallet.coldkey
-        success, error = await transfer_tao_keep_alive(client, wallet, dest, amount)
+        _ = wallet.coldkey  # unlock
+        wallet_plans.append((w["name"], wallet, amount))
+
+    # Send all transfers in parallel (different coldkeys = no nonce conflict)
+    console.print(f"  [dim]Sending {len(wallet_plans)} transfers in parallel...[/dim]")
+
+    async def collect_one(name, wallet, amount):
+        try:
+            success, error = await transfer_tao_keep_alive(client, wallet, dest, amount)
+            return (name, amount, success, error)
+        except Exception as e:
+            return (name, amount, False, str(e))
+
+    tasks = [collect_one(name, w, amt) for name, w, amt in wallet_plans]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Display results
+    ok_count = 0
+    fail_count = 0
+    collected_total = 0.0
+    failed_list = []
+    for r in results:
+        if isinstance(r, Exception):
+            print_error(f"Task failed: {r}")
+            fail_count += 1
+            continue
+        name, amount, success, error = r
         if success:
-            print_success(f"Collected {amount:.4f} TAO from {w['name']}")
+            print_success(f"Collected {amount:.4f} TAO from {name}")
+            ok_count += 1
+            collected_total += amount
         else:
-            print_error(f"Failed {w['name']}: {error}")
+            print_error(f"Failed {name}: {error}")
+            fail_count += 1
+            failed_list.append((name, amount, error))
+
+    console.print(
+        f"\n  Done: [green]{ok_count} ok[/green] ({collected_total:.4f} TAO), "
+        f"[red]{fail_count} failed[/red]"
+    )
+
+    # Retry failed ones sequentially if any
+    if failed_list and Confirm.ask(f"Retry {len(failed_list)} failed transfers?"):
+        for name, amount, _ in failed_list:
+            console.print(f"  Retrying {name}...")
+            wallet = load_wallet(name, base_path=base_path)
+            _ = wallet.coldkey
+            success, error = await transfer_tao_keep_alive(client, wallet, dest, amount)
+            if success:
+                print_success(f"Collected {amount:.4f} TAO from {name}")
+            else:
+                print_error(f"Failed again {name}: {error}")
 
 
 # ========================================================================
