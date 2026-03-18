@@ -453,36 +453,92 @@ async def _transfer_batch(client, base_path):
     console.print(f"  Source: [cyan]{w['name']}[/cyan] ({addr})")
     console.print(f"  Available: [green]{bal['free_tao']:.4f} TAO[/green]")
 
-    transfers = []
-    console.print("  Enter destinations (empty line to finish):")
-    while True:
-        dest = Prompt.ask("  Dest SS58 (or empty to stop)", default="")
-        if not dest:
-            break
-        amount = FloatPrompt.ask("  Amount TAO")
-        if amount > 0:
-            transfers.append((dest, amount))
+    console.print("\n  [cyan]1.[/cyan] Enter destinations one by one (SS58 + amount each)")
+    console.print("  [cyan]2.[/cyan] Send same amount to multiple wallets (names or SS58, comma-separated)")
+    mode = Prompt.ask("Select", choices=["1", "2"], default="2")
+
+    transfers = []  # list of (dest_ss58, amount, label)
+
+    if mode == "1":
+        console.print("  Enter destinations (empty line to finish):")
+        while True:
+            dest = Prompt.ask("  Dest SS58 (or empty to stop)", default="")
+            if not dest:
+                break
+            amount = FloatPrompt.ask("  Amount TAO")
+            if amount > 0:
+                transfers.append((dest, amount, dest[:16] + "..."))
+    else:
+        console.print("  Enter destination wallet names or SS58 addresses (comma-separated):")
+        console.print("  [dim]You can also use 'group:name' or wallet names like reg_1,reg_2[/dim]")
+        dest_input = Prompt.ask("  Destinations")
+        amount = FloatPrompt.ask("  Amount TAO per wallet")
+        if amount <= 0:
+            print_error("Amount must be > 0")
+            return
+
+        # Resolve destinations: could be wallet names, group, or SS58 addresses
+        all_wallets = list_wallets(base_path)
+
+        # Check if it's a group reference
+        if dest_input.strip().lower().startswith("group:"):
+            group_name = dest_input.strip()[6:].strip()
+            group_wallet_names = get_group(group_name)
+            if group_wallet_names is None:
+                print_error(f"Group '{group_name}' not found")
+                return
+            parts = group_wallet_names
+        else:
+            parts = [p.strip() for p in dest_input.split(",") if p.strip()]
+
+        name_map = {ww["name"]: ww for ww in all_wallets}
+
+        for part in parts:
+            # Check if it's a wallet name
+            if part in name_map:
+                dest_addr = get_coldkey_ss58(part, base_path)
+                if dest_addr:
+                    transfers.append((dest_addr, amount, part))
+                else:
+                    print_warn(f"Could not resolve address for {part}, skipping")
+            elif part.startswith("5") and len(part) >= 46:
+                # Looks like SS58 address
+                transfers.append((part, amount, part[:16] + "..."))
+            else:
+                print_warn(f"'{part}' not found, skipping")
+
     if not transfers:
         print_warn("No transfers entered")
         return
 
-    total = sum(a for _, a in transfers)
-    console.print(f"\n  Total: [yellow]{total:.4f} TAO[/yellow] to {len(transfers)} addresses")
+    total = sum(a for _, a, _ in transfers)
+    console.print(f"\n  Sending to {len(transfers)} destinations:")
+    for dest_ss58, amt, label in transfers:
+        console.print(f"    {label:>16}: {amt:.4f} TAO")
+    console.print(f"  [yellow]Total: {total:.4f} TAO[/yellow]")
+
     if total > bal["free_tao"]:
-        print_error("Insufficient balance")
+        print_error(f"Insufficient balance ({bal['free_tao']:.4f} TAO available)")
         return
     if not Confirm.ask("Proceed with batch transfer?"):
         return
 
     console.print("  [dim]Unlocking coldkey...[/dim]")
     _ = wallet.coldkey
-    for dest, amount in transfers:
-        console.print(f"  Sending {amount} TAO → {dest[:20]}...")
-        success, error = await transfer_tao_keep_alive(client, wallet, dest, amount)
+
+    ok_count = 0
+    fail_count = 0
+    for dest_ss58, amt, label in transfers:
+        console.print(f"  Sending {amt} TAO → {label}...")
+        success, error = await transfer_tao_keep_alive(client, wallet, dest_ss58, amt)
         if success:
-            print_success(f"Sent {amount} TAO")
+            print_success(f"Sent {amt} TAO → {label}")
+            ok_count += 1
         else:
-            print_error(f"Failed: {error}")
+            print_error(f"Failed {label}: {error}")
+            fail_count += 1
+
+    console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
 
 
 async def _transfer_collect(client, base_path):
