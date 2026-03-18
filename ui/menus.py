@@ -526,19 +526,47 @@ async def _transfer_batch(client, base_path):
     console.print("  [dim]Unlocking coldkey...[/dim]")
     _ = wallet.coldkey
 
-    ok_count = 0
-    fail_count = 0
-    for dest_ss58, amt, label in transfers:
-        console.print(f"  Sending {amt} TAO → {label}...")
-        success, error = await transfer_tao_keep_alive(client, wallet, dest_ss58, amt)
+    if mode == "2" and len(transfers) > 1:
+        # Use utility.batch_all — single tx, single block
+        from core.substrate_client import tao_to_rao
+        calls = []
+        for dest_ss58, amt, label in transfers:
+            calls.append({
+                "call_module": "Balances",
+                "call_function": "transfer_keep_alive",
+                "call_params": {
+                    "dest": dest_ss58,
+                    "value": tao_to_rao(amt),
+                },
+            })
+        console.print(f"  [dim]Submitting batch ({len(calls)} transfers in 1 tx)...[/dim]")
+        success, error = await client.submit_batch(calls, keypair=wallet.coldkey)
         if success:
-            print_success(f"Sent {amt} TAO → {label}")
-            ok_count += 1
+            print_success(f"Batch sent: {len(transfers)} transfers, {total:.4f} TAO total")
         else:
-            print_error(f"Failed {label}: {error}")
-            fail_count += 1
-
-    console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
+            print_error(f"Batch failed: {error}")
+            if Confirm.ask("Retry transfers one by one?"):
+                for dest_ss58, amt, label in transfers:
+                    console.print(f"  Sending {amt} TAO → {label}...")
+                    success, error = await transfer_tao_keep_alive(client, wallet, dest_ss58, amt)
+                    if success:
+                        print_success(f"Sent {amt} TAO → {label}")
+                    else:
+                        print_error(f"Failed {label}: {error}")
+    else:
+        # Sequential mode
+        ok_count = 0
+        fail_count = 0
+        for dest_ss58, amt, label in transfers:
+            console.print(f"  Sending {amt} TAO → {label}...")
+            success, error = await transfer_tao_keep_alive(client, wallet, dest_ss58, amt)
+            if success:
+                print_success(f"Sent {amt} TAO → {label}")
+                ok_count += 1
+            else:
+                print_error(f"Failed {label}: {error}")
+                fail_count += 1
+        console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
 
 
 async def _transfer_collect(client, base_path):

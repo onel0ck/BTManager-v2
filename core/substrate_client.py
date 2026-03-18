@@ -513,3 +513,57 @@ class SubstrateClient:
 
         except Exception as e:
             return False, str(e)
+
+    async def submit_batch(
+        self,
+        calls: list[dict],
+        keypair,
+        wait_for_inclusion: bool = True,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Submit multiple calls as a single batch extrinsic (utility.batch_all).
+        All calls succeed or all fail (atomic).
+
+        Args:
+            calls: list of dicts with {call_module, call_function, call_params}
+            keypair: signing keypair
+            wait_for_inclusion: wait for block inclusion
+
+        Returns:
+            (success, error_message)
+        """
+        self._ensure_connected()
+        try:
+            composed_calls = []
+            for c in calls:
+                call = await self.substrate.compose_call(
+                    call_module=c["call_module"],
+                    call_function=c["call_function"],
+                    call_params=c["call_params"],
+                )
+                composed_calls.append(call)
+
+            batch_call = await self.substrate.compose_call(
+                call_module="Utility",
+                call_function="batch_all",
+                call_params={"calls": composed_calls},
+            )
+
+            extrinsic = await self.substrate.create_signed_extrinsic(
+                call=batch_call,
+                keypair=keypair,
+            )
+
+            receipt = await self.substrate.submit_extrinsic(
+                extrinsic,
+                wait_for_inclusion=wait_for_inclusion,
+            )
+
+            if await receipt.is_success:
+                return True, None
+            else:
+                error = await receipt.error_message
+                return False, str(error) if error else "Unknown error"
+
+        except Exception as e:
+            return False, str(e)
