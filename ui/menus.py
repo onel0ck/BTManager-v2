@@ -404,15 +404,18 @@ async def handle_transfer(client: SubstrateClient, config: dict):
 
     console.print("  [cyan]1.[/cyan] Single transfer")
     console.print("  [cyan]2.[/cyan] Batch transfer (one sender → multiple destinations)")
-    console.print("  [cyan]3.[/cyan] Collect (multiple wallets → one destination)")
-    mode = Prompt.ask("Select mode", choices=["1", "2", "3"], default="1")
+    console.print("  [cyan]3.[/cyan] Collect TAO (multiple wallets → one destination)")
+    console.print("  [cyan]4.[/cyan] Collect Alpha (move+transfer stake to one wallet)")
+    mode = Prompt.ask("Select mode", choices=["1", "2", "3", "4"], default="1")
 
     if mode == "1":
         await _transfer_single(client, base_path)
     elif mode == "2":
         await _transfer_batch(client, base_path)
-    else:
+    elif mode == "3":
         await _transfer_collect(client, base_path)
+    else:
+        await _transfer_collect_alpha(client, base_path)
 
 
 async def _transfer_single(client, base_path):
@@ -655,6 +658,184 @@ async def _transfer_collect(client, base_path):
                 print_success(f"Collected {amount:.4f} TAO from {name}")
             else:
                 print_error(f"Failed again {name}: {error}")
+
+
+async def _transfer_collect_alpha(client, base_path):
+    """Collect alpha tokens from multiple wallets to one destination via move_stake + transfer_stake."""
+    from core.substrate_client import tao_to_rao
+    from core.stats import decode_ss58
+
+    TAOSTATS_VALIDATOR = "5GKH9FPPnWSUoeeTJp19wVtd84XqFW4pyK2ijV2GsFbhTrP1"
+
+    netuid = IntPrompt.ask("Subnet ID (netuid)")
+
+    selected = select_wallets(base_path, "Select source wallet(s)")
+    if not selected:
+        return
+
+    # Destination coldkey
+    console.print("\n  [bold]Destination coldkey:[/bold]")
+    dest_wallets = list_wallets(base_path)
+    dest_name_map = {w["name"]: w for w in dest_wallets}
+    dest_input = Prompt.ask("  Destination coldkey (wallet name or SS58)")
+    if dest_input in dest_name_map:
+        dest_coldkey_ss58 = get_coldkey_ss58(dest_input, base_path)
+        console.print(f"  → [cyan]{dest_input}[/cyan] ({dest_coldkey_ss58})")
+    else:
+        dest_coldkey_ss58 = dest_input
+
+    # Destination hotkey (validator)
+    dest_hotkey_ss58 = Prompt.ask(
+        "  Destination hotkey (validator SS58)",
+        default=TAOSTATS_VALIDATOR,
+    )
+    console.print(f"  → Validator: [cyan]{dest_hotkey_ss58[:16]}...[/cyan]")
+
+    # Scan source wallets for alpha on this subnet
+    console.print(f"\n  [dim]Scanning alpha on SN{netuid}...[/dim]")
+
+    collect_plan = []  # list of (wallet_name, coldkey_ss58, hotkey_ss58, alpha_rao, alpha_tao)
+    from core.substrate_client import rao_to_tao
+
+    for w in selected:
+        addr = get_coldkey_ss58(w["name"], base_path)
+        if not addr:
+            continue
+
+        try:
+            stakes = await client.get_stake_info_for_coldkey(addr)
+        except Exception as e:
+            print_error(f"Failed to get stakes for {w['name']}: {e}")
+            continue
+
+        for entry in stakes:
+            if not isinstance(entry, dict):
+                continue
+            entry_netuid = entry.get("netuid", 0)
+            if entry_netuid != netuid:
+                continue
+            alpha_rao = entry.get("stake", 0)
+            if alpha_rao <= 0:
+                continue
+
+            hotkey = decode_ss58(entry.get("hotkey", ""))
+            alpha_tao = rao_to_tao(alpha_rao)
+            collect_plan.append((w["name"], addr, hotkey, alpha_rao, alpha_tao))
+            console.print(
+                f"  {w['name']:>12} | HK {hotkey[:12]}... | {alpha_tao:.4f} alpha"
+            )
+
+    if not collect_plan:
+        print_info(f"No alpha found on SN{netuid} across selected wallets")
+        return
+
+    total_alpha = sum(a for _, _, _, _, a in collect_plan)
+    console.print(f"\n  Total: [yellow]{total_alpha:.4f} alpha[/yellow] from {len(collect_plan)} positions")
+    console.print(f"  Destination coldkey: [cyan]{dest_coldkey_ss58[:16]}...[/cyan]")
+    console.print(f"  Destination hotkey: [cyan]{dest_hotkey_ss58[:16]}...[/cyan]")
+    console.print(f"  Subnet: [cyan]SN{netuid}[/cyan]")
+
+    if not Confirm.ask("Proceed with alpha collect?"):
+        return
+
+    # Unlock all source coldkeys
+    console.print("  [dim]Unlocking all coldkeys...[/dim]")
+    wallet_cache = {}  # name -> wallet (unlocked)
+    for name, _, _, _, _ in collect_plan:
+        if name not in wallet_cache:
+            wallet = load_wallet(name, base_path=base_path)
+            _ = wallet.coldkey  # unlock
+            wallet_cache[name] = wallet
+
+    # Group by wallet for batching
+    # For each source coldkey, build batch: move_stake(s) + transfer_stake(s)
+    from itertools import groupby
+    wallet_groups = {}
+    for name, coldkey_ss58, hotkey_ss58, alpha_rao, alpha_tao in collect_plan:
+        if name not in wallet_groups:
+            wallet_groups[name] = []
+        wallet_groups[name].append((coldkey_ss58, hotkey_ss58, alpha_rao, alpha_tao))
+
+    ok_count = 0
+    fail_count = 0
+
+    async def process_wallet(name, entries):
+        """Process all alpha positions for one wallet as a batch."""
+        wallet = wallet_cache[name]
+        calls = []
+
+        for coldkey_ss58, hotkey_ss58, alpha_rao, alpha_tao in entries:
+            needs_move = hotkey_ss58 != dest_hotkey_ss58
+            needs_transfer = coldkey_ss58 != dest_coldkey_ss58
+
+            if needs_move:
+                # move_stake: origin_hotkey → destination_hotkey (same coldkey, same subnet)
+                calls.append({
+                    "call_module": "SubtensorModule",
+                    "call_function": "move_stake",
+                    "call_params": {
+                        "origin_hotkey": hotkey_ss58,
+                        "destination_hotkey": dest_hotkey_ss58,
+                        "origin_netuid": netuid,
+                        "destination_netuid": netuid,
+                        "alpha_amount": alpha_rao,
+                    },
+                })
+
+            if needs_transfer:
+                # transfer_stake: origin_coldkey → destination_coldkey (same hotkey after move)
+                transfer_hotkey = dest_hotkey_ss58 if needs_move else hotkey_ss58
+                calls.append({
+                    "call_module": "SubtensorModule",
+                    "call_function": "transfer_stake",
+                    "call_params": {
+                        "destination_coldkey": dest_coldkey_ss58,
+                        "hotkey": transfer_hotkey,
+                        "origin_netuid": netuid,
+                        "destination_netuid": netuid,
+                        "alpha_amount": alpha_rao,
+                    },
+                })
+
+            if not needs_move and not needs_transfer:
+                # Already at destination
+                return (name, True, "already at destination")
+
+        if not calls:
+            return (name, True, "nothing to do")
+
+        if len(calls) == 1:
+            c = calls[0]
+            success, error = await client.compose_and_submit_checked(
+                call_module=c["call_module"],
+                call_function=c["call_function"],
+                call_params=c["call_params"],
+                keypair=wallet.coldkey,
+            )
+        else:
+            success, error = await client.submit_batch(calls, keypair=wallet.coldkey)
+
+        return (name, success, error)
+
+    # Run all wallets in parallel (different coldkeys)
+    console.print(f"  [dim]Processing {len(wallet_groups)} wallets in parallel...[/dim]")
+    tasks = [process_wallet(name, entries) for name, entries in wallet_groups.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, Exception):
+            print_error(f"Task failed: {r}")
+            fail_count += 1
+            continue
+        name, success, error = r
+        if success:
+            print_success(f"Collected alpha from {name}")
+            ok_count += 1
+        else:
+            print_error(f"Failed {name}: {error}")
+            fail_count += 1
+
+    console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
 
 
 # ========================================================================
