@@ -10,6 +10,7 @@ from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao
 from core.wallet_ops import (
     list_wallets, load_wallet, get_coldkey_ss58,
     create_coldkey_with_hotkeys, add_hotkeys_to_wallet, create_hotkey,
+    batch_create_wallets,
 )
 from core.balance import check_balance, check_all_balances
 from core.staking import remove_stake, unstake_all, unstake_subnet
@@ -21,6 +22,7 @@ from ui.display import (
     display_balance_table, display_wallet_stats, display_multi_wallet_stats,
     display_subnet_overview, display_wallet_list,
 )
+from utils.wallet_groups import load_groups, create_group, delete_group, get_group, list_group_names
 
 MENU_OPTIONS = [
     ("1", "Create Wallet (Coldkey/Hotkey)"),
@@ -30,6 +32,7 @@ MENU_OPTIONS = [
     ("5", "Transfer TAO"),
     ("6", "Unstake"),
     ("7", "Subnet Info"),
+    ("8", "Wallet Groups"),
     ("0", "Exit"),
 ]
 
@@ -54,6 +57,23 @@ def _resolve_wallets(input_str: str, wallets: list[dict]) -> list[dict]:
     input_str = input_str.strip()
     if input_str.lower() == "all":
         return wallets
+
+    # Check for group: prefix (e.g. "group:sn-11")
+    if input_str.lower().startswith("group:"):
+        group_name = input_str[6:].strip()
+        group_wallets = get_group(group_name)
+        if group_wallets is None:
+            console.print(f"  [red]Group '{group_name}' not found[/red]")
+            return []
+        # Convert group wallet names to wallet dicts
+        name_map = {w["name"]: w for w in wallets}
+        result = []
+        for wn in group_wallets:
+            if wn in name_map:
+                result.append(name_map[wn])
+            else:
+                console.print(f"  [yellow]'{wn}' from group not found, skipping[/yellow]")
+        return result
 
     parts = [p.strip() for p in input_str.split(",") if p.strip()]
     result = []
@@ -91,7 +111,14 @@ def select_wallets(base_path: str, prompt: str = "Select wallet(s)", allow_multi
         print_warn("No wallets found. Create one first.")
         return []
     display_wallet_list(wallets)
-    hint = " (name, #, comma-separated, or 'all')" if allow_multi else " (name or #)"
+
+    # Show available groups if any
+    group_names = list_group_names()
+    if group_names and allow_multi:
+        groups_str = ", ".join(group_names)
+        console.print(f"  [dim]Groups: {groups_str}[/dim]")
+
+    hint = " (name, #, comma-separated, 'all', or 'group:name')" if allow_multi else " (name or #)"
     user_input = Prompt.ask(f"{prompt}{hint}")
     selected = _resolve_wallets(user_input, wallets)
     if not selected:
@@ -141,7 +168,8 @@ async def handle_create_wallet(config: dict):
 
     console.print("  [cyan]1.[/cyan] Create new coldkey (+ hotkeys)")
     console.print("  [cyan]2.[/cyan] Add hotkeys to existing coldkey")
-    choice = Prompt.ask("Select", choices=["1", "2"])
+    console.print("  [cyan]3.[/cyan] Batch create multiple wallets")
+    choice = Prompt.ask("Select", choices=["1", "2", "3"])
 
     if choice == "1":
         name = Prompt.ask("Coldkey name")
@@ -163,7 +191,7 @@ async def handle_create_wallet(config: dict):
             print_success(f"Created {created} hotkeys (1-{created})")
         except Exception as e:
             print_error(f"Failed: {e}")
-    else:
+    elif choice == "2":
         w = select_single_wallet(base_path, "Select coldkey to add hotkeys")
         if not w:
             return
@@ -176,6 +204,42 @@ async def handle_create_wallet(config: dict):
             print_success(f"Created hotkeys {start}-{end} for {w['name']}")
         except Exception as e:
             print_error(f"Failed: {e}")
+    else:
+        # Batch create multiple wallets
+        base_name = Prompt.ask("Base name (e.g. wallet_reg)")
+        coldkey_count = IntPrompt.ask("Number of coldkeys to create")
+        hotkey_count = IntPrompt.ask("Number of hotkeys per coldkey", default=5)
+        use_pw = Confirm.ask("Encrypt coldkeys with password?", default=False)
+
+        console.print(
+            f"\n  Will create [cyan]{coldkey_count}[/cyan] wallets: "
+            f"[cyan]{base_name}_1[/cyan] ... [cyan]{base_name}_{coldkey_count}[/cyan]"
+        )
+        console.print(f"  Each with [cyan]{hotkey_count}[/cyan] hotkeys (1-{hotkey_count})")
+        total = coldkey_count * hotkey_count
+        console.print(f"  Total: [yellow]{coldkey_count} coldkeys + {total} hotkeys[/yellow]")
+
+        if not Confirm.ask("Proceed?"):
+            return
+
+        def on_progress(name, msg):
+            console.print(f"  [dim]{name}:[/dim] {msg}")
+
+        try:
+            results = batch_create_wallets(
+                base_name=base_name,
+                coldkey_count=coldkey_count,
+                hotkey_count=hotkey_count,
+                use_password=use_pw,
+                base_path=base_path,
+                on_progress=on_progress,
+            )
+            console.print()
+            print_success(f"Created {len(results)} wallets:")
+            for name, ss58, hk_count in results:
+                console.print(f"    [cyan]{name}[/cyan]: {ss58} ({hk_count} hotkeys)")
+        except Exception as e:
+            print_error(f"Batch creation failed: {e}")
 
 
 # ========================================================================
@@ -248,11 +312,14 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
 
         # Load hotkey SS58 addresses for registration checks
         hotkey_ss58_list = []
+        hotkey_name_map = {}  # ss58 -> hotkey name
         from bittensor_wallet import Wallet
         for hk_name in (w.get("hotkeys") or []):
             try:
                 hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
-                hotkey_ss58_list.append(hw.hotkey.ss58_address)
+                hk_ss58 = hw.hotkey.ss58_address
+                hotkey_ss58_list.append(hk_ss58)
+                hotkey_name_map[hk_ss58] = hk_name
             except Exception:
                 pass
 
@@ -260,6 +327,7 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
             client, addr, include_usd=show_usd,
             hotkey_ss58_list=hotkey_ss58_list,
             neuron_cache=neuron_cache,
+            hotkey_name_map=hotkey_name_map,
         )
         all_stats.append((w["name"], stats))
 
@@ -661,6 +729,83 @@ async def handle_subnet_info(client: SubstrateClient, config: dict):
 
 
 # ========================================================================
+# 8. Wallet Groups
+# ========================================================================
+
+async def handle_wallet_groups(config: dict):
+    print_header("Wallet Groups")
+    base_path = config["wallet"]["base_path"]
+
+    console.print("  [cyan]1.[/cyan] Create / update group")
+    console.print("  [cyan]2.[/cyan] View groups")
+    console.print("  [cyan]3.[/cyan] Delete group")
+    choice = Prompt.ask("Select", choices=["1", "2", "3"])
+
+    if choice == "1":
+        group_name = Prompt.ask("Group name (e.g. sn-11)")
+
+        # Show existing wallets for reference
+        wallets = list_wallets(base_path)
+        if wallets:
+            display_wallet_list(wallets)
+
+        console.print(
+            "  Enter coldkey names (comma-separated, or 'all', or select by #):"
+        )
+        user_input = Prompt.ask("Wallets")
+
+        if user_input.strip().lower() == "all":
+            wallet_names = [w["name"] for w in wallets]
+        else:
+            # Resolve input like _resolve_wallets but just get names
+            resolved = _resolve_wallets(user_input, wallets)
+            wallet_names = [w["name"] for w in resolved]
+
+        if not wallet_names:
+            print_error("No wallets specified")
+            return
+
+        existing = get_group(group_name)
+        if existing:
+            console.print(f"  [yellow]Group '{group_name}' exists ({len(existing)} wallets), will overwrite[/yellow]")
+            if not Confirm.ask("Overwrite?"):
+                return
+
+        create_group(group_name, wallet_names)
+        print_success(f"Group '{group_name}' saved with {len(wallet_names)} wallets:")
+        for wn in wallet_names:
+            console.print(f"    [cyan]{wn}[/cyan]")
+
+    elif choice == "2":
+        groups = load_groups()
+        if not groups:
+            print_info("No groups created yet")
+            return
+
+        for gname, gwallets in sorted(groups.items()):
+            console.print(f"\n  [bold cyan]{gname}[/bold cyan] ({len(gwallets)} wallets):")
+            for wn in gwallets:
+                console.print(f"    {wn}")
+        console.print(f"\n  [dim]Use 'group:<name>' when selecting wallets in any mode[/dim]")
+
+    else:
+        groups = load_groups()
+        if not groups:
+            print_info("No groups to delete")
+            return
+
+        console.print("  Existing groups:")
+        for gname in sorted(groups.keys()):
+            console.print(f"    [cyan]{gname}[/cyan] ({len(groups[gname])} wallets)")
+
+        name = Prompt.ask("Group to delete")
+        if delete_group(name):
+            print_success(f"Deleted group '{name}'")
+        else:
+            print_error(f"Group '{name}' not found")
+
+
+# ========================================================================
 # Main loop
 # ========================================================================
 
@@ -672,6 +817,7 @@ HANDLERS = {
     "5": handle_transfer,
     "6": handle_unstake,
     "7": handle_subnet_info,
+    "8": handle_wallet_groups,
 }
 
 
@@ -685,7 +831,7 @@ async def main_menu_loop(client: SubstrateClient, config: dict):
         handler = HANDLERS.get(choice)
         if handler:
             try:
-                if choice == "1":
+                if choice in ("1", "8"):
                     await handler(config)
                 else:
                     await handler(client, config)

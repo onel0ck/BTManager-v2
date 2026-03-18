@@ -99,6 +99,7 @@ def display_wallet_stats(stats: dict, wallet_name: str = ""):
         table = Table(title="Registered Subnets", show_lines=True)
         table.add_column("SN", style="cyan", justify="right")
         table.add_column("Name", style="white")
+        table.add_column("HK", style="bold white", justify="right")
         table.add_column("Hotkey", style="dim", no_wrap=True)
         table.add_column("UID", style="white", justify="right")
         table.add_column("α Stake", justify="right", style="yellow")
@@ -113,6 +114,7 @@ def display_wallet_stats(stats: dict, wallet_name: str = ""):
 
         for s in stats["subnets"]:
             hk = str(s["hotkey"])
+            hk_name = s.get("hotkey_name", "") or ""
             reg = "✓" if s["is_registered"] else "✗"
             uid_str = str(s["uid"]) if s.get("uid") is not None else "-"
             inc = s.get("incentive", 0)
@@ -122,6 +124,7 @@ def display_wallet_stats(stats: dict, wallet_name: str = ""):
             row = [
                 str(s["netuid"]),
                 s["subnet_name"],
+                hk_name,
                 hk,
                 uid_str,
                 f"{s['alpha_stake']:.4f}",

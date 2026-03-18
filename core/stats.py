@@ -119,6 +119,7 @@ async def get_wallet_stats(
     include_usd: bool = True,
     hotkey_ss58_list: list = None,
     neuron_cache: dict = None,
+    hotkey_name_map: dict = None,
 ) -> dict:
     """
     Get comprehensive wallet stats.
@@ -126,6 +127,7 @@ async def get_wallet_stats(
     Args:
         neuron_cache: pre-built {hotkey -> [{netuid, uid, emission, ...}]} from build_global_neuron_cache()
                       emission values are alpha RAO per tempo.
+        hotkey_name_map: optional {hotkey_ss58: hotkey_name} for display purposes.
     """
     tasks = {
         "balance": client.get_balance(coldkey_ss58),
@@ -163,6 +165,7 @@ async def get_wallet_stats(
     total_staked_tao = 0.0
     total_emission_tao_per_block = 0.0
     seen_pairs = set()
+    hk_name_map = hotkey_name_map or {}
 
     stakes = results.get("stakes", []) or []
     for entry in stakes:
@@ -215,6 +218,7 @@ async def get_wallet_stats(
                 "netuid": netuid,
                 "subnet_name": name_map.get(netuid, f"SN{netuid}"),
                 "hotkey": hotkey,
+                "hotkey_name": hk_name_map.get(hotkey, ""),
                 "uid": uid,
                 "alpha_stake": alpha_tao,
                 "tao_value": tao_value,
@@ -242,6 +246,7 @@ async def get_wallet_stats(
                     "netuid": netuid,
                     "subnet_name": name_map.get(netuid, f"SN{netuid}"),
                     "hotkey": hk,
+                    "hotkey_name": hk_name_map.get(hk, ""),
                     "uid": nd["uid"],
                     "alpha_stake": 0.0,
                     "tao_value": 0.0,

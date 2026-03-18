@@ -156,6 +156,70 @@ def add_hotkeys_to_wallet(
     return start, end
 
 
+def batch_create_wallets(
+    base_name: str,
+    coldkey_count: int,
+    hotkey_count: int,
+    use_password: bool = False,
+    base_path: str = "~/.bittensor/wallets",
+    on_progress=None,
+) -> list[tuple[str, str, int]]:
+    """
+    Batch create multiple coldkeys, each with N hotkeys.
+    
+    Creates wallets named: {base_name}_1, {base_name}_2, ...
+    Each with hotkeys: 1, 2, ..., hotkey_count
+    
+    Args:
+        base_name: Base name prefix (e.g. 'wallet_reg')
+        coldkey_count: Number of coldkeys to create
+        hotkey_count: Number of hotkeys per coldkey
+        use_password: Encrypt coldkeys with password
+        base_path: Wallets directory
+        on_progress: Optional callback(wallet_name, step_msg) for progress updates
+        
+    Returns:
+        List of (wallet_name, ss58_address, hotkeys_created)
+    """
+    wallets_dir = get_wallets_path(base_path)
+    results = []
+
+    for idx in range(1, coldkey_count + 1):
+        name = f"{base_name}_{idx}"
+
+        if (wallets_dir / name).exists():
+            if on_progress:
+                on_progress(name, "already exists, skipping")
+            logger.warning(f"Wallet '{name}' already exists, skipping")
+            continue
+
+        # Create coldkey
+        wallet = Wallet(name=name, path=base_path)
+        wallet.create_new_coldkey(
+            use_password=use_password,
+            overwrite=False,
+            suppress=True,
+        )
+        ss58 = wallet.coldkeypub.ss58_address
+        logger.info(f"Created coldkey: {name} -> {ss58}")
+
+        if on_progress:
+            on_progress(name, f"coldkey created ({ss58[:16]}...)")
+
+        # Create hotkeys
+        for i in range(1, hotkey_count + 1):
+            hw = Wallet(name=name, hotkey=str(i), path=base_path)
+            hw.create_new_hotkey(use_password=False, overwrite=False, suppress=True)
+
+        logger.info(f"Created {hotkey_count} hotkeys for {name}")
+        if on_progress:
+            on_progress(name, f"{hotkey_count} hotkeys created")
+
+        results.append((name, ss58, hotkey_count))
+
+    return results
+
+
 def create_hotkey(
     coldkey_name: str,
     hotkey_name: str = "default",
