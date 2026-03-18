@@ -249,13 +249,13 @@ async def handle_create_wallet(config: dict):
 async def handle_check_balances(client: SubstrateClient, config: dict):
     print_header("Check Balances")
     base_path = config["wallet"]["base_path"]
-    wallets = list_wallets(base_path)
-    if not wallets:
-        print_warn("No wallets found.")
+
+    selected = select_wallets(base_path, "Select wallet(s) for balance check")
+    if not selected:
         return
 
     addresses = []
-    for w in wallets:
+    for w in selected:
         addr = get_coldkey_ss58(w["name"], base_path)
         if addr:
             addresses.append({"name": w["name"], "address": addr})
