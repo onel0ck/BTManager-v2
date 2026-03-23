@@ -730,7 +730,30 @@ async def _transfer_collect_alpha(client, base_path):
         return
 
     total_alpha = sum(a for _, _, _, _, a in collect_plan)
-    console.print(f"\n  Total: [yellow]{total_alpha:.4f} alpha[/yellow] from {len(collect_plan)} positions")
+    console.print(f"\n  Total available: [yellow]{total_alpha:.4f} alpha[/yellow] from {len(collect_plan)} positions")
+
+    amount_input = Prompt.ask("  Amount to collect per position (or 'max')", default="max")
+    if amount_input.lower() != "max":
+        try:
+            requested_amount = float(amount_input)
+            if requested_amount <= 0:
+                print_error("Amount must be > 0")
+                return
+        except ValueError:
+            print_error("Invalid amount")
+            return
+
+        # Cap each position at requested amount
+        from core.substrate_client import tao_to_rao as _tao_to_rao
+        capped_plan = []
+        for name, coldkey_ss58, hotkey_ss58, alpha_rao, alpha_tao in collect_plan:
+            send_tao = min(requested_amount, alpha_tao)
+            send_rao = _tao_to_rao(send_tao)
+            capped_plan.append((name, coldkey_ss58, hotkey_ss58, send_rao, send_tao))
+        collect_plan = capped_plan
+        total_alpha = sum(a for _, _, _, _, a in collect_plan)
+
+    console.print(f"  Will collect: [yellow]{total_alpha:.4f} alpha[/yellow]")
     console.print(f"  Destination coldkey: [cyan]{dest_coldkey_ss58[:16]}...[/cyan]")
     console.print(f"  Destination hotkey: [cyan]{dest_hotkey_ss58[:16]}...[/cyan]")
     console.print(f"  Subnet: [cyan]SN{netuid}[/cyan]")
