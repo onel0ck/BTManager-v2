@@ -995,29 +995,64 @@ async def handle_unstake(client: SubstrateClient, config: dict):
         w = select_single_wallet(base_path)
         if not w:
             return
-        hk_names = select_hotkey(w)
-        if not hk_names:
-            return
         netuid = IntPrompt.ask("Subnet ID (netuid)")
-        hotkey_names = hk_names
 
-        wallet_obj = None
-        for hk in hotkey_names:
-            wallet = load_wallet(w["name"], hk, base_path)
-            hotkey_ss58 = wallet.hotkey.ss58_address
-            if wallet_obj is None:
-                console.print("  [dim]Unlocking coldkey...[/dim]")
-                _ = wallet.coldkey
-                wallet_obj = wallet
-            console.print(f"  Unstaking {hk} from SN{netuid}...")
-            success, error = await unstake_subnet(client, wallet, hotkey_ss58, netuid)
+        # Scan for actual staked hotkeys on this subnet (including external validators)
+        addr = get_coldkey_ss58(w["name"], base_path)
+        if not addr:
+            print_error(f"Could not load address for {w['name']}")
+            return
+
+        console.print(f"  [dim]Scanning stakes on SN{netuid}...[/dim]")
+        try:
+            stakes = await client.get_stake_info_for_coldkey(addr)
+        except Exception as e:
+            print_error(f"Failed to get stakes: {e}")
+            return
+
+        from core.stats import decode_ss58
+        from core.substrate_client import rao_to_tao
+
+        staked_hotkeys = []  # list of (hotkey_ss58, alpha_rao, alpha_tao)
+        for entry in stakes:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("netuid", 0) != netuid:
+                continue
+            alpha_rao = entry.get("stake", 0)
+            if alpha_rao <= 0:
+                continue
+            hk = decode_ss58(entry.get("hotkey", ""))
+            alpha_tao = rao_to_tao(alpha_rao)
+            staked_hotkeys.append((hk, alpha_rao, alpha_tao))
+            console.print(f"    HK {hk[:16]}... | {alpha_tao:.4f} alpha")
+
+        if not staked_hotkeys:
+            print_info(f"No stake found on SN{netuid} for {w['name']}")
+            return
+
+        total_alpha = sum(a for _, _, a in staked_hotkeys)
+        console.print(f"  Total: [yellow]{total_alpha:.4f} alpha[/yellow] across {len(staked_hotkeys)} hotkey(s)")
+
+        if not Confirm.ask(f"Unstake all from SN{netuid}?"):
+            return
+
+        console.print("  [dim]Unlocking coldkey...[/dim]")
+        wallet = load_wallet(w["name"], base_path=base_path)
+        _ = wallet.coldkey
+
+        for hk_ss58, alpha_rao, alpha_tao in staked_hotkeys:
+            console.print(f"  Unstaking {alpha_tao:.4f} from HK {hk_ss58[:16]}...")
+            success, error = await unstake_subnet(client, wallet, hk_ss58, netuid)
             if success:
-                print_success(f"Unstaked {hk} from SN{netuid}")
+                print_success(f"Unstaked from HK {hk_ss58[:16]}...")
             else:
                 if error and "NotEnoughStake" in str(error):
-                    print_info(f"{hk}: no stake")
+                    print_info(f"HK {hk_ss58[:16]}: no stake")
+                elif error and "AmountTooLow" in str(error):
+                    print_info(f"HK {hk_ss58[:16]}: amount too low, skipping")
                 else:
-                    print_error(f"{hk}: {error}")
+                    print_error(f"HK {hk_ss58[:16]}: {error}")
 
     else:
         w = select_single_wallet(base_path)
