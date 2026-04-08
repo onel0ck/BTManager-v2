@@ -397,14 +397,18 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
 
     # Copy-friendly output
     if unique_wallets:
-        wallet_list = ",".join(unique_wallets)
-        console.print(f"\n  [bold]Registered wallets (copy-friendly):[/bold]")
-        console.print(f"  {wallet_list}")
+        # Group hotkeys by wallet
+        wallet_hotkeys = {}
+        for wname, hk_name, _, _ in registered:
+            if wname not in wallet_hotkeys:
+                wallet_hotkeys[wname] = []
+            wallet_hotkeys[wname].append(hk_name)
 
-    if not_registered_wallets:
-        not_reg_list = ",".join(sorted(not_registered_wallets))
-        console.print(f"\n  [bold]Not registered wallets (copy-friendly):[/bold]")
-        console.print(f"  {not_reg_list}")
+        console.print(f"\n  [bold]Registered (copy-friendly):[/bold]")
+        for wname in unique_wallets:
+            hks = ",".join(wallet_hotkeys[wname])
+            console.print(f"  {wname}/{hks}")
+        console.print(f"\n  [bold]Total: {len(registered)} hotkeys, {len(unique_wallets)} wallets[/bold]")
 
 
 # ========================================================================
