@@ -290,6 +290,15 @@ async def handle_check_balances(client: SubstrateClient, config: dict):
 async def handle_wallet_stats(client: SubstrateClient, config: dict):
     print_header("Wallet Stats")
     base_path = config["wallet"]["base_path"]
+
+    console.print("  [cyan]1.[/cyan] Full wallet stats")
+    console.print("  [cyan]2.[/cyan] Check registrations on subnet")
+    stats_mode = Prompt.ask("Select", choices=["1", "2"], default="1")
+
+    if stats_mode == "2":
+        await _check_subnet_registrations(client, config)
+        return
+
     selected = select_wallets(base_path, "Select wallet(s) for stats")
     if not selected:
         return
@@ -333,6 +342,69 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
 
     if all_stats:
         display_multi_wallet_stats(all_stats)
+
+
+async def _check_subnet_registrations(client: SubstrateClient, config: dict):
+    """Check which wallets/hotkeys are registered on a specific subnet."""
+    base_path = config["wallet"]["base_path"]
+    netuid = IntPrompt.ask("Subnet ID (netuid)")
+
+    selected = select_wallets(base_path, "Select wallet(s) to check")
+    if not selected:
+        return
+
+    console.print(f"  [dim]Checking registrations on SN{netuid}...[/dim]")
+
+    from bittensor_wallet import Wallet
+
+    registered = []  # list of (wallet_name, hotkey_name, hotkey_ss58, uid)
+    not_registered_wallets = []
+
+    for w in selected:
+        wallet_has_reg = False
+        for hk_name in (w.get("hotkeys") or []):
+            try:
+                hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
+                hk_ss58 = hw.hotkey.ss58_address
+                uid = await client.get_uid_for_hotkey_on_subnet(netuid, hk_ss58)
+                if uid is not None:
+                    registered.append((w["name"], hk_name, hk_ss58, uid))
+                    wallet_has_reg = True
+            except Exception:
+                continue
+        if not wallet_has_reg:
+            not_registered_wallets.append(w["name"])
+
+    # Display table
+    if registered:
+        table = Table(title=f"Registered on SN{netuid}", show_lines=True)
+        table.add_column("Wallet", style="cyan")
+        table.add_column("HK", style="bold white", justify="right")
+        table.add_column("UID", style="yellow", justify="right")
+        table.add_column("Hotkey Address", style="dim", no_wrap=True)
+
+        for wname, hk_name, hk_ss58, uid in registered:
+            table.add_row(wname, hk_name, str(uid), hk_ss58)
+
+        console.print(table)
+
+    # Summary
+    unique_wallets = sorted(set(wname for wname, _, _, _ in registered))
+    console.print(f"\n  [bold]Summary SN{netuid}:[/bold]")
+    console.print(f"  Registered: [green]{len(registered)} hotkeys[/green] across [green]{len(unique_wallets)} wallets[/green]")
+    if not_registered_wallets:
+        console.print(f"  Not registered: [red]{len(not_registered_wallets)} wallets[/red]")
+
+    # Copy-friendly output
+    if unique_wallets:
+        wallet_list = ",".join(unique_wallets)
+        console.print(f"\n  [bold]Registered wallets (copy-friendly):[/bold]")
+        console.print(f"  {wallet_list}")
+
+    if not_registered_wallets:
+        not_reg_list = ",".join(sorted(not_registered_wallets))
+        console.print(f"\n  [bold]Not registered wallets (copy-friendly):[/bold]")
+        console.print(f"  {not_reg_list}")
 
 
 # ========================================================================
