@@ -5,6 +5,7 @@ Interactive menu system using Rich.
 
 import asyncio
 from rich.prompt import Prompt, IntPrompt, Confirm, FloatPrompt
+from rich.table import Table
 
 from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao
 from core.wallet_ops import (
