@@ -905,8 +905,25 @@ async def _transfer_distribute_alpha(client, base_path):
 
     total_available = sum(a for _, _, a in src_positions)
     console.print(f"  Source: [cyan]{src_w['name']}[/cyan] | {total_available:.4f} alpha on SN{netuid}")
-    for hk, _, alpha_tao in src_positions:
-        console.print(f"    HK {hk[:16]}... | {alpha_tao:.4f} alpha")
+    for i, (hk, _, alpha_tao) in enumerate(src_positions, 1):
+        console.print(f"    [cyan]{i}.[/cyan] HK {hk[:16]}... | {alpha_tao:.4f} alpha")
+
+    if len(src_positions) > 1:
+        console.print(f"    [cyan]0.[/cyan] Use all hotkeys")
+        hk_choice = Prompt.ask("Select source hotkey", default="0")
+        if hk_choice != "0":
+            try:
+                idx = int(hk_choice)
+                if 1 <= idx <= len(src_positions):
+                    src_positions = [src_positions[idx - 1]]
+                    total_available = src_positions[0][2]
+                    console.print(f"  Using: HK {src_positions[0][0][:16]}... | {total_available:.4f} alpha")
+                else:
+                    print_error("Invalid selection")
+                    return
+            except ValueError:
+                print_error("Invalid selection")
+                return
 
     # Select destination wallets
     dest_selected = select_wallets(base_path, "Select destination wallet(s)")
