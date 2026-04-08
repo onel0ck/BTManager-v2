@@ -346,7 +346,7 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
 
 
 async def _check_subnet_registrations(client: SubstrateClient, config: dict):
-    """Check which wallets/hotkeys are registered on a specific subnet."""
+    """Check which wallets/hotkeys are registered on a specific subnet with stake/emission info."""
     base_path = config["wallet"]["base_path"]
     netuid = IntPrompt.ask("Subnet ID (netuid)")
 
@@ -357,20 +357,82 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
     console.print(f"  [dim]Checking registrations on SN{netuid}...[/dim]")
 
     from bittensor_wallet import Wallet
+    from core.substrate_client import rao_to_tao, decode_price
+    from ui.display import BLOCKS_PER_DAY
 
-    registered = []  # list of (wallet_name, hotkey_name, hotkey_ss58, uid)
+    # Get subnet dynamic info for price and tempo
+    dynamic_info = await client.get_subnet_dynamic_info(netuid)
+    moving_price = 0.0
+    tempo = 360
+    if dynamic_info:
+        moving_price = decode_price(dynamic_info.get("moving_price", 0))
+        tempo = dynamic_info.get("tempo", 360)
+
+    tao_price = await fetch_tao_price()
+
+    # Get neurons for emission data
+    neurons_map = {}  # hotkey_ss58 -> neuron_data
+    try:
+        neurons = await client.get_neurons_lite(netuid)
+        for n in neurons:
+            if isinstance(n, dict):
+                from core.stats import decode_ss58
+                hk = decode_ss58(n.get("hotkey", ""))
+                neurons_map[hk] = n
+    except Exception:
+        pass
+
+    # Get stake info per coldkey
+    coldkey_stakes = {}  # coldkey_ss58 -> {hotkey_ss58: alpha_rao}
+    for w in selected:
+        addr = get_coldkey_ss58(w["name"], base_path)
+        if not addr:
+            continue
+        try:
+            stakes = await client.get_stake_info_for_coldkey(addr)
+            stake_map = {}
+            for entry in stakes:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("netuid", 0) != netuid:
+                    continue
+                from core.stats import decode_ss58
+                hk = decode_ss58(entry.get("hotkey", ""))
+                stake_map[hk] = entry.get("stake", 0)
+            coldkey_stakes[addr] = stake_map
+        except Exception:
+            coldkey_stakes[addr] = {}
+
+    # Check registrations
+    registered = []  # list of (wallet_name, hotkey_name, hotkey_ss58, uid, alpha_tao, tao_value, daily_tao, incentive)
     not_registered_wallets = []
 
     for w in selected:
+        addr = get_coldkey_ss58(w["name"], base_path)
         wallet_has_reg = False
         for hk_name in (w.get("hotkeys") or []):
             try:
                 hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
                 hk_ss58 = hw.hotkey.ss58_address
                 uid = await client.get_uid_for_hotkey_on_subnet(netuid, hk_ss58)
-                if uid is not None:
-                    registered.append((w["name"], hk_name, hk_ss58, uid))
-                    wallet_has_reg = True
+                if uid is None:
+                    continue
+
+                # Stake
+                alpha_rao = coldkey_stakes.get(addr, {}).get(hk_ss58, 0)
+                alpha_tao = rao_to_tao(alpha_rao)
+                tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
+
+                # Emission from neuron data
+                neuron = neurons_map.get(hk_ss58, {})
+                emission_alpha_per_tempo = rao_to_tao(neuron.get("emission", 0))
+                emission_tao_per_tempo = emission_alpha_per_tempo * moving_price if moving_price > 0 else 0.0
+                emission_tao_per_block = emission_tao_per_tempo / tempo if tempo > 0 else 0.0
+                daily_tao = emission_tao_per_block * BLOCKS_PER_DAY
+                incentive = neuron.get("incentive", 0)
+
+                registered.append((w["name"], hk_name, hk_ss58, uid, alpha_tao, tao_value, daily_tao, incentive))
+                wallet_has_reg = True
             except Exception:
                 continue
         if not wallet_has_reg:
@@ -382,15 +444,52 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         table.add_column("Wallet", style="cyan")
         table.add_column("HK", style="bold white", justify="right")
         table.add_column("UID", style="yellow", justify="right")
-        table.add_column("Hotkey Address", style="dim", no_wrap=True)
+        table.add_column("α Stake", justify="right", style="yellow")
+        table.add_column("τ Value", justify="right", style="green")
+        if tao_price:
+            table.add_column("USD", justify="right", style="yellow")
+        table.add_column("τ/day", justify="right", style="magenta")
+        if tao_price:
+            table.add_column("$/day", justify="right", style="bold green")
+        table.add_column("Inc", justify="right", style="blue")
+        table.add_column("Hotkey", style="dim", no_wrap=True)
 
-        for wname, hk_name, hk_ss58, uid in registered:
-            table.add_row(wname, hk_name, str(uid), hk_ss58)
+        total_stake = 0.0
+        total_tao_value = 0.0
+        total_daily = 0.0
+
+        for wname, hk_name, hk_ss58, uid, alpha_tao, tao_value, daily_tao, incentive in registered:
+            inc_str = f"{incentive/65535*100:.1f}%" if incentive else "0"
+            row = [wname, hk_name, str(uid), f"{alpha_tao:.4f}", f"{tao_value:.4f}"]
+            if tao_price:
+                row.append(f"${tao_value * tao_price:,.2f}")
+            row.append(f"{daily_tao:.6f}")
+            if tao_price:
+                row.append(f"${daily_tao * tao_price:,.2f}")
+            row.extend([inc_str, hk_ss58])
+            table.add_row(*row)
+            total_stake += alpha_tao
+            total_tao_value += tao_value
+            total_daily += daily_tao
 
         console.print(table)
 
+        # Totals
+        console.print(f"\n  [bold]Totals:[/bold]")
+        console.print(f"  α Stake: [yellow]{total_stake:.4f}[/yellow]")
+        console.print(f"  τ Value: [green]{total_tao_value:.4f}[/green]", end="")
+        if tao_price:
+            console.print(f" [yellow](${total_tao_value * tao_price:,.2f})[/yellow]")
+        else:
+            console.print()
+        console.print(f"  Daily: [magenta]{total_daily:.4f} τ/day[/magenta]", end="")
+        if tao_price:
+            console.print(f" [bold green](${total_daily * tao_price:,.2f}/day)[/bold green]")
+        else:
+            console.print()
+
     # Summary
-    unique_wallets = sorted(set(wname for wname, _, _, _ in registered))
+    unique_wallets = sorted(set(wname for wname, _, _, _, _, _, _, _ in registered))
     console.print(f"\n  [bold]Summary SN{netuid}:[/bold]")
     console.print(f"  Registered: [green]{len(registered)} hotkeys[/green] across [green]{len(unique_wallets)} wallets[/green]")
     if not_registered_wallets:
@@ -398,9 +497,8 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
 
     # Copy-friendly output
     if unique_wallets:
-        # Group hotkeys by wallet
         wallet_hotkeys = {}
-        for wname, hk_name, _, _ in registered:
+        for wname, hk_name, _, _, _, _, _, _ in registered:
             if wname not in wallet_hotkeys:
                 wallet_hotkeys[wname] = []
             wallet_hotkeys[wname].append(hk_name)
