@@ -210,6 +210,12 @@ async def get_wallet_stats(
             incentive = 0
             is_registered = entry.get("is_registered", False)
 
+        # Only count emission and registration for our own hotkeys
+        is_own_hotkey = hotkey in hk_name_map
+        if not is_own_hotkey:
+            emission_tao_per_block = 0.0
+            is_registered = False
+
         total_emission_tao_per_block += emission_tao_per_block
         seen_pairs.add((hotkey, netuid))
 
