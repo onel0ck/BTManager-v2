@@ -537,6 +537,20 @@ async def handle_register(client: SubstrateClient, config: dict):
     if info.get("current_neurons") is not None:
         console.print(f"  Neurons: {info['current_neurons']} / {info.get('max_neurons', '?')}")
 
+    limit_input = Prompt.ask("  Max burn price TAO (or 'no' for no limit)", default="no")
+    if limit_input.lower() == "no":
+        limit_price_tao = None
+    else:
+        try:
+            limit_price_tao = float(limit_input)
+            if limit_price_tao <= 0:
+                print_error("Limit must be > 0")
+                return
+            console.print(f"  Limit: [cyan]{limit_price_tao:.9f} TAO[/cyan]")
+        except ValueError:
+            print_error("Invalid limit price")
+            return
+
     if len(hotkey_names) > 1:
         if not Confirm.ask(f"Register {len(hotkey_names)} hotkeys on SN{netuid}?"):
             return
@@ -562,7 +576,10 @@ async def handle_register(client: SubstrateClient, config: dict):
             wallet_obj = wallet
 
         console.print("  [dim]Submitting registration...[/dim]")
-        success, error, uid = await burn_register(client, wallet, hotkey_ss58, netuid)
+        success, error, uid = await burn_register(
+            client, wallet, hotkey_ss58, netuid,
+            limit_price_tao=limit_price_tao,
+        )
         if success:
             print_success(f"Registered on SN{netuid}! UID: {uid}")
         else:

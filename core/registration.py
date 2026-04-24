@@ -5,7 +5,7 @@ Signed by COLDKEY (not hotkey).
 """
 
 from typing import Optional
-from core.substrate_client import SubstrateClient, rao_to_tao
+from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao
 from utils.logger import setup_logger
 
 logger = setup_logger("registration")
@@ -82,6 +82,7 @@ async def burn_register(
     hotkey_ss58: str,
     netuid: int,
     check_balance: bool = True,
+    limit_price_tao: float = None,
 ) -> tuple[bool, Optional[str], Optional[int]]:
     """
     Register a hotkey on a subnet via burn registration.
@@ -94,6 +95,8 @@ async def burn_register(
         hotkey_ss58: Hotkey SS58 address to register
         netuid: Subnet ID to register on
         check_balance: Pre-check if balance sufficient
+        limit_price_tao: Max burn price in TAO. If set, uses register_limit
+                         to reject if burn exceeds this price.
         
     Returns:
         (success, error_message, uid)
@@ -103,6 +106,13 @@ async def burn_register(
     burn_rao = await client.get_burn_cost(netuid)
     burn_tao = rao_to_tao(burn_rao)
     logger.info(f"Burn cost for SN{netuid}: {burn_tao:.9f} TAO")
+
+    if limit_price_tao is not None and burn_tao > limit_price_tao:
+        return (
+            False,
+            f"Burn cost {burn_tao:.9f} TAO exceeds limit {limit_price_tao:.9f} TAO",
+            None,
+        )
 
     if check_balance:
         balance = await client.get_balance(wallet.coldkeypub.ss58_address)
@@ -118,17 +128,30 @@ async def burn_register(
     if existing_uid is not None:
         return True, f"Already registered with UID {existing_uid}", existing_uid
 
-    # Submit burned_register extrinsic
-    logger.info(f"Submitting burn registration: SN{netuid} hotkey={hotkey_ss58[:12]}...")
+    # Submit registration extrinsic
+    # Use register_limit if limit_price is set, otherwise burned_register
+    if limit_price_tao is not None:
+        limit_price_rao = tao_to_rao(limit_price_tao)
+        logger.info(f"Submitting register_limit: SN{netuid} hotkey={hotkey_ss58[:12]}... limit={limit_price_tao:.9f} TAO")
+        call_function = "register_limit"
+        call_params = {
+            "netuid": netuid,
+            "hotkey": hotkey_ss58,
+            "limit_price": limit_price_rao,
+        }
+    else:
+        logger.info(f"Submitting burned_register: SN{netuid} hotkey={hotkey_ss58[:12]}...")
+        call_function = "burned_register"
+        call_params = {
+            "netuid": netuid,
+            "hotkey": hotkey_ss58,
+        }
 
     try:
         receipt = await client.compose_and_submit(
             call_module="SubtensorModule",
-            call_function="burned_register",
-            call_params={
-                "netuid": netuid,
-                "hotkey": hotkey_ss58,
-            },
+            call_function=call_function,
+            call_params=call_params,
             keypair=wallet.coldkey,
             wait_for_inclusion=True,
         )
