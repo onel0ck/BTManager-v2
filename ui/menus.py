@@ -1680,7 +1680,8 @@ async def handle_subnet_info(client: SubstrateClient, config: dict):
 
     console.print("  [cyan]1.[/cyan] Subnet overview")
     console.print("  [cyan]2.[/cyan] Pruning prediction (who gets kicked next)")
-    mode = Prompt.ask("Select", choices=["1", "2"], default="1")
+    console.print("  [cyan]3.[/cyan] Validator weights analysis")
+    mode = Prompt.ask("Select", choices=["1", "2", "3"], default="1")
 
     netuid = IntPrompt.ask("Subnet ID (netuid)")
 
@@ -1694,9 +1695,12 @@ async def handle_subnet_info(client: SubstrateClient, config: dict):
             display_subnet_overview(info, tao_price=tao_price)
         else:
             print_error(f"Could not load info for SN{netuid}")
-    else:
+    elif mode == "2":
         top_n = IntPrompt.ask("Show top N at risk", default=30)
         await _pruning_prediction(client, config, netuid, top_n)
+    else:
+        num_epochs = IntPrompt.ask("Number of epochs to show (1=current only)", default=1)
+        await _weights_analysis(client, config, netuid, num_epochs)
 
 
 async def _pruning_prediction(client, config, netuid, top_n=30):
@@ -1897,6 +1901,165 @@ async def _pruning_prediction(client, config, netuid, top_n=30):
         print_warn(f"Subnet FULL ({num_n}/{num_max}) — registration will trigger pruning")
     else:
         print_info(f"Subnet has {num_max - num_n} free slots ({num_n}/{num_max})")
+
+
+async def _weights_analysis(client, config, netuid, num_epochs=1):
+    """Analyze validator weights on a subnet, optionally across epochs."""
+    from core.stats import decode_ss58
+    from async_substrate_interface import AsyncSubstrateInterface
+
+    ARCHIVE_URL = "wss://archive.chain.opentensor.ai:443"
+
+    def cv(v):
+        if isinstance(v, dict):
+            return v.get("value", v.get("__Compact", 0))
+        return v if v is not None else 0
+
+    async def get_weights_for_epoch(substrate, nid, val_uids, block_hash=None):
+        weights = {}
+        for vuid in val_uids:
+            try:
+                result = await substrate.query(
+                    module="SubtensorModule",
+                    storage_function="Weights",
+                    params=[nid, vuid],
+                    block_hash=block_hash,
+                )
+                data = result.value if hasattr(result, "value") else result
+                if data:
+                    weights[vuid] = [(uid, w) for uid, w in data]
+            except Exception:
+                pass
+        return weights
+
+    console.print(f"  [dim]Fetching metagraph for SN{netuid}...[/dim]")
+    meta = await client.get_metagraph(netuid)
+    if not meta:
+        print_error(f"Could not fetch metagraph for SN{netuid}")
+        return
+
+    vpermit = meta.get("validator_permit", [])
+    hotkeys = meta.get("hotkeys", [])
+    tempo = cv(meta.get("tempo", 360))
+    current_block = cv(meta.get("block", 0))
+    last_step = cv(meta.get("last_step", 0))
+    n = cv(meta.get("num_uids", 0))
+
+    hk_list = []
+    for hk in hotkeys:
+        hk_list.append(decode_ss58(hk) if isinstance(hk, (tuple, list)) else str(hk))
+
+    val_uids = [i for i, v in enumerate(vpermit) if v]
+    console.print(f"  Neurons: [cyan]{n}[/cyan], Tempo: [cyan]{tempo}[/cyan], Validators: [cyan]{len(val_uids)}[/cyan]")
+    console.print(f"  Last epoch: block [cyan]{last_step}[/cyan]")
+
+    # Find our UIDs
+    base_path = config["wallet"]["base_path"]
+    our_hotkeys = set()
+    from bittensor_wallet import Wallet
+    for w in list_wallets(base_path):
+        for hk_name in (w.get("hotkeys") or []):
+            try:
+                hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
+                our_hotkeys.add(hw.hotkey.ss58_address)
+            except Exception:
+                continue
+
+    our_uids = set()
+    for uid, hk in enumerate(hk_list):
+        if hk in our_hotkeys:
+            our_uids.add(uid)
+    if our_uids:
+        console.print(f"  Your UIDs: [green]{sorted(our_uids)}[/green]")
+
+    def display_epoch_weights(weights, label):
+        if not weights:
+            print_info(f"No weights data for {label}")
+            return
+
+        console.print(f"\n  [bold]{label}[/bold]")
+
+        # Per-validator table
+        for vuid in val_uids:
+            if vuid not in weights:
+                continue
+            w_list = weights[vuid]
+            if not w_list:
+                continue
+            sorted_w = sorted(w_list, key=lambda x: x[1], reverse=True)
+            vhk = hk_list[vuid][:12] if vuid < len(hk_list) else "?"
+            entries = []
+            for target, weight in sorted_w:
+                if weight == 0:
+                    continue
+                pct = weight / 65535 * 100
+                marker = " ★" if target in our_uids else ""
+                entries.append(f"UID{target}={pct:.1f}%{marker}")
+            if entries:
+                console.print(f"    Val UID {vuid:>3} ({vhk}...): {', '.join(entries[:10])}")
+                if len(entries) > 10:
+                    console.print(f"         ... +{len(entries)-10} more")
+
+        # Top miners by validator count
+        uid_weight_count = {}
+        for vuid, w_list in weights.items():
+            for target, weight in w_list:
+                if weight > 0:
+                    if target not in uid_weight_count:
+                        uid_weight_count[target] = []
+                    uid_weight_count[target].append((vuid, weight))
+
+        top_miners = sorted(uid_weight_count.items(), key=lambda x: len(x[1]), reverse=True)
+        if top_miners:
+            console.print(f"\n    [bold]Top miners by validator count:[/bold]")
+            for uid, vals in top_miners[:10]:
+                avg_w = sum(w for _, w in vals) / len(vals) / 65535 * 100
+                marker = " [bold green]★ YOURS[/bold green]" if uid in our_uids else ""
+                hk = hk_list[uid][:12] if uid < len(hk_list) else "?"
+                console.print(f"      UID {uid:>3} ({hk}...): {len(vals)} validators, avg {avg_w:.1f}%{marker}")
+
+    # Current epoch
+    current_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
+    display_epoch_weights(current_weights, f"Current epoch (block {current_block})")
+
+    # Historical epochs
+    if num_epochs > 1:
+        console.print(f"\n  [dim]Connecting to archive node...[/dim]")
+        try:
+            archive = AsyncSubstrateInterface(url=ARCHIVE_URL, ss58_format=42)
+            await archive.initialize()
+
+            for epoch_i in range(1, num_epochs):
+                epoch_block = last_step - (tempo * epoch_i)
+                if epoch_block <= 0:
+                    break
+                try:
+                    block_hash = await archive.get_block_hash(epoch_block)
+                    if not block_hash:
+                        continue
+                    epoch_weights = await get_weights_for_epoch(archive, netuid, val_uids, block_hash)
+                    display_epoch_weights(epoch_weights, f"Epoch -{epoch_i} (block {epoch_block})")
+                except Exception as e:
+                    print_error(f"Epoch -{epoch_i} failed: {e}")
+
+            await archive.close()
+        except Exception as e:
+            print_error(f"Archive connection failed: {e}")
+
+    # Our UIDs summary
+    if our_uids:
+        console.print(f"\n  [bold cyan]═══ Your UIDs Weight Summary ═══[/bold cyan]")
+        for uid in sorted(our_uids):
+            received_from = []
+            for vuid, w_list in current_weights.items():
+                for target, weight in w_list:
+                    if target == uid and weight > 0:
+                        received_from.append((vuid, weight))
+            if received_from:
+                vals_str = ", ".join([f"Val{v}={w/65535*100:.1f}%" for v, w in received_from])
+                print_success(f"UID {uid:>3} ({hk_list[uid][:16]}...): {len(received_from)} validators — {vals_str}")
+            else:
+                print_warn(f"UID {uid:>3} ({hk_list[uid][:16]}...): NO weights from any validator")
 
 
 # ========================================================================
