@@ -1677,16 +1677,226 @@ async def handle_unstake(client: SubstrateClient, config: dict):
 
 async def handle_subnet_info(client: SubstrateClient, config: dict):
     print_header("Subnet Info")
+
+    console.print("  [cyan]1.[/cyan] Subnet overview")
+    console.print("  [cyan]2.[/cyan] Pruning prediction (who gets kicked next)")
+    mode = Prompt.ask("Select", choices=["1", "2"], default="1")
+
     netuid = IntPrompt.ask("Subnet ID (netuid)")
-    console.print(f"  Loading SN{netuid} info...")
-    info, tao_price = await asyncio.gather(
-        get_subnet_overview(client, netuid),
-        fetch_tao_price()
-    )
-    if info:
-        display_subnet_overview(info, tao_price=tao_price)
+
+    if mode == "1":
+        console.print(f"  Loading SN{netuid} info...")
+        info, tao_price = await asyncio.gather(
+            get_subnet_overview(client, netuid),
+            fetch_tao_price()
+        )
+        if info:
+            display_subnet_overview(info, tao_price=tao_price)
+        else:
+            print_error(f"Could not load info for SN{netuid}")
     else:
-        print_error(f"Could not load info for SN{netuid}")
+        top_n = IntPrompt.ask("Show top N at risk", default=30)
+        await _pruning_prediction(client, config, netuid, top_n)
+
+
+async def _pruning_prediction(client, config, netuid, top_n=30):
+    """Predict which UIDs will be pruned next on a subnet."""
+    from core.stats import decode_ss58
+
+    def cv(v):
+        """Extract value from Compact dict or return as-is."""
+        if isinstance(v, dict):
+            return v.get("value", v.get("__Compact", 0))
+        return v if v is not None else 0
+
+    console.print(f"  [dim]Fetching metagraph for SN{netuid}...[/dim]")
+    metagraph = await client.get_metagraph(netuid)
+    if not metagraph:
+        print_error(f"Could not fetch metagraph for SN{netuid}")
+        return
+
+    # Extract data
+    n = cv(metagraph.get("num_uids", 0))
+    max_uids = cv(metagraph.get("max_uids", 0))
+    hotkeys = metagraph.get("hotkeys", [])
+    coldkeys = metagraph.get("coldkeys", [])
+    emissions = [cv(e) for e in metagraph.get("emission", [])]
+    block_at_reg = [cv(b) for b in metagraph.get("block_at_registration", [])]
+    immunity_period = cv(metagraph.get("immunity_period", 0))
+    current_block = cv(metagraph.get("block", 0))
+
+    owner_hotkey = metagraph.get("owner_hotkey", "")
+    if isinstance(owner_hotkey, (tuple, list)):
+        owner_hotkey = decode_ss58(owner_hotkey)
+    owner_coldkey = metagraph.get("owner_coldkey", "")
+    if isinstance(owner_coldkey, (tuple, list)):
+        owner_coldkey = decode_ss58(owner_coldkey)
+
+    # Get ImmuneOwnerUidsLimit
+    try:
+        result = await client.substrate.query(
+            module="SubtensorModule", storage_function="ImmuneOwnerUidsLimit", params=[netuid],
+        )
+        immune_owner_limit = result.value if hasattr(result, "value") else (result or 3)
+    except Exception:
+        immune_owner_limit = 3
+
+    # Get MinNonImmuneUids
+    try:
+        result = await client.substrate.query(
+            module="SubtensorModule", storage_function="MinNonImmuneUids", params=[netuid],
+        )
+        min_non_immune = result.value if hasattr(result, "value") else (result or 0)
+    except Exception:
+        min_non_immune = 0
+
+    console.print(f"  Neurons: [cyan]{n} / {max_uids}[/cyan]")
+    console.print(f"  Immunity period: [cyan]{immunity_period}[/cyan] blocks")
+    console.print(f"  ImmuneOwnerUidsLimit: [cyan]{immune_owner_limit}[/cyan]")
+    console.print(f"  MinNonImmuneUids: [cyan]{min_non_immune}[/cyan]")
+
+    # Build owner immune UIDs
+    owner_uids = []
+    for uid in range(n):
+        if uid < len(coldkeys):
+            ck = coldkeys[uid]
+            if isinstance(ck, (tuple, list)):
+                ck = decode_ss58(ck)
+            if str(ck) == str(owner_coldkey):
+                rb = block_at_reg[uid] if uid < len(block_at_reg) else 0
+                owner_uids.append((rb, uid))
+    owner_uids.sort(key=lambda x: (x[0], x[1]))
+    immune_owner_uids = set(uid for _, uid in owner_uids[:immune_owner_limit])
+
+    # Add subnet owner hotkey UID
+    owner_hk_str = str(owner_hotkey)
+    for uid in range(n):
+        if uid < len(hotkeys):
+            hk = hotkeys[uid]
+            if isinstance(hk, (tuple, list)):
+                hk = decode_ss58(hk)
+            if str(hk) == owner_hk_str:
+                immune_owner_uids.add(uid)
+                break
+
+    # Check which UIDs are ours
+    base_path = config["wallet"]["base_path"]
+    our_hotkeys = set()
+    wallets = list_wallets(base_path)
+    from bittensor_wallet import Wallet
+    for w in wallets:
+        for hk_name in (w.get("hotkeys") or []):
+            try:
+                hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
+                our_hotkeys.add(hw.hotkey.ss58_address)
+            except Exception:
+                continue
+
+    # Classify neurons
+    pruneable = []
+    immune_list = []
+    immortal_list = []
+    for uid in range(n):
+        if uid >= len(emissions) or uid >= len(block_at_reg) or uid >= len(hotkeys):
+            continue
+        emission = emissions[uid]
+        reg_block = block_at_reg[uid]
+        hk = hotkeys[uid]
+        if isinstance(hk, (tuple, list)):
+            hk = decode_ss58(hk)
+        hk_str = str(hk)
+
+        if uid in immune_owner_uids:
+            status = "IMMORTAL"
+        elif current_block - reg_block < immunity_period:
+            status = "IMMUNE"
+        else:
+            status = "PRUNEABLE"
+
+        is_ours = hk_str in our_hotkeys
+        entry = {
+            "uid": uid,
+            "emission": emission,
+            "reg_block": reg_block,
+            "hotkey": hk_str,
+            "status": status,
+            "blocks_since_reg": current_block - reg_block,
+            "immunity_remaining": max(0, immunity_period - (current_block - reg_block)),
+            "is_ours": is_ours,
+        }
+        if status == "PRUNEABLE":
+            pruneable.append(entry)
+        elif status == "IMMUNE":
+            immune_list.append(entry)
+        else:
+            immortal_list.append(entry)
+
+    console.print(f"\n  [bold]Status breakdown:[/bold]")
+    console.print(f"    Pruneable: [yellow]{len(pruneable)}[/yellow]")
+    console.print(f"    Immune: [green]{len(immune_list)}[/green] (recently registered)")
+    console.print(f"    Immortal: [cyan]{len(immortal_list)}[/cyan] (owner protected)")
+
+    can_prune_non_immune = len(pruneable) > min_non_immune
+
+    def prune_sort_key(e):
+        return (e["emission"], e["reg_block"], e["uid"])
+
+    pruneable.sort(key=prune_sort_key)
+    immune_list.sort(key=prune_sort_key)
+
+    if can_prune_non_immune:
+        prune_order = pruneable + immune_list
+    else:
+        prune_order = immune_list + pruneable
+        print_warn(f"Non-immune count ({len(pruneable)}) <= MinNonImmuneUids ({min_non_immune})")
+        console.print(f"    → Will prune IMMUNE neurons first")
+
+    # Display table
+    if prune_order:
+        show_n = min(top_n, len(prune_order))
+        table = Table(title=f"Top {show_n} UIDs at risk — SN{netuid}", show_lines=True)
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("UID", style="cyan", justify="right")
+        table.add_column("Emission", justify="right")
+        table.add_column("Status", justify="center")
+        table.add_column("Reg Block", justify="right", style="dim")
+        table.add_column("Since", justify="right")
+        table.add_column("Hotkey", style="dim", no_wrap=True)
+        table.add_column("Ours", justify="center")
+
+        for i, entry in enumerate(prune_order[:show_n], 1):
+            status_style = {"PRUNEABLE": "yellow", "IMMUNE": "green", "IMMORTAL": "cyan"}.get(entry["status"], "white")
+            ours_mark = "[bold green]★[/bold green]" if entry["is_ours"] else ""
+            table.add_row(
+                str(i),
+                str(entry["uid"]),
+                str(entry["emission"]),
+                f"[{status_style}]{entry['status']}[/{status_style}]",
+                str(entry["reg_block"]),
+                str(entry["blocks_since_reg"]),
+                entry["hotkey"][:20] + "...",
+                ours_mark,
+            )
+        console.print(table)
+
+        next_victim = prune_order[0]
+        console.print(f"\n  → Next to be pruned: [bold red]UID {next_victim['uid']}[/bold red] "
+                      f"(emission: {next_victim['emission']}, {next_victim['status']})")
+
+    # Our UIDs at risk
+    our_at_risk = [e for e in prune_order if e["is_ours"]]
+    if our_at_risk:
+        console.print(f"\n  [bold yellow]⚠ Your UIDs at risk ({len(our_at_risk)}):[/bold yellow]")
+        for e in our_at_risk[:20]:
+            rank = prune_order.index(e) + 1
+            console.print(f"    UID {e['uid']:>3} | rank #{rank} | emission: {e['emission']} | {e['hotkey'][:16]}...")
+
+    num_n = int(n)
+    num_max = int(max_uids)
+    if num_n >= num_max:
+        print_warn(f"Subnet FULL ({num_n}/{num_max}) — registration will trigger pruning")
+    else:
+        print_info(f"Subnet has {num_max - num_n} free slots ({num_n}/{num_max})")
 
 
 # ========================================================================
