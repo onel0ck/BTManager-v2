@@ -1940,6 +1940,7 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
 
     vpermit = meta.get("validator_permit", [])
     hotkeys = meta.get("hotkeys", [])
+    coldkeys = meta.get("coldkeys", [])
     tempo = cv(meta.get("tempo", 360))
     current_block = cv(meta.get("block", 0))
     last_step = cv(meta.get("last_step", 0))
@@ -1949,15 +1950,25 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
     for hk in hotkeys:
         hk_list.append(decode_ss58(hk) if isinstance(hk, (tuple, list)) else str(hk))
 
+    # Decode coldkeys per UID
+    ck_list = []
+    for ck in coldkeys:
+        ck_list.append(decode_ss58(ck) if isinstance(ck, (tuple, list)) else str(ck))
+
     val_uids = [i for i, v in enumerate(vpermit) if v]
     console.print(f"  Neurons: [cyan]{n}[/cyan], Tempo: [cyan]{tempo}[/cyan], Validators: [cyan]{len(val_uids)}[/cyan]")
     console.print(f"  Last epoch: block [cyan]{last_step}[/cyan]")
 
-    # Find our UIDs
+    # Find our UIDs — by hotkey AND by coldkey
     base_path = config["wallet"]["base_path"]
     our_hotkeys = set()
+    our_coldkeys = set()
     from bittensor_wallet import Wallet
     for w in list_wallets(base_path):
+        # Get coldkey
+        ck_addr = get_coldkey_ss58(w["name"], base_path)
+        if ck_addr:
+            our_coldkeys.add(ck_addr)
         for hk_name in (w.get("hotkeys") or []):
             try:
                 hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
@@ -1966,20 +1977,25 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
                 continue
 
     our_uids = set()
-    for uid, hk in enumerate(hk_list):
-        if hk in our_hotkeys:
+    for uid in range(len(hk_list)):
+        if hk_list[uid] in our_hotkeys:
             our_uids.add(uid)
+        elif uid < len(ck_list) and ck_list[uid] in our_coldkeys:
+            our_uids.add(uid)
+
     if our_uids:
-        console.print(f"  Your UIDs: [green]{sorted(our_uids)}[/green]")
+        console.print(f"  Your UIDs: [green]{sorted(our_uids)}[/green] ({len(our_uids)} total)")
 
     def display_epoch_weights(weights, label):
         if not weights:
             print_info(f"No weights data for {label}")
             return
 
-        console.print(f"\n  [bold]{label}[/bold]")
+        console.print(f"\n  [bold cyan]{'═' * 50}[/bold cyan]")
+        console.print(f"  [bold]{label}[/bold]")
+        console.print(f"  [bold cyan]{'═' * 50}[/bold cyan]")
 
-        # Per-validator table
+        # Per-validator breakdown
         for vuid in val_uids:
             if vuid not in weights:
                 continue
@@ -1993,14 +2009,14 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
                 if weight == 0:
                     continue
                 pct = weight / 65535 * 100
-                marker = " ★" if target in our_uids else ""
+                marker = " [bold green]★[/bold green]" if target in our_uids else ""
                 entries.append(f"UID{target}={pct:.1f}%{marker}")
             if entries:
                 console.print(f"    Val UID {vuid:>3} ({vhk}...): {', '.join(entries[:10])}")
                 if len(entries) > 10:
                     console.print(f"         ... +{len(entries)-10} more")
 
-        # Top miners by validator count
+        # Top miners table
         uid_weight_count = {}
         for vuid, w_list in weights.items():
             for target, weight in w_list:
@@ -2009,57 +2025,99 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
                         uid_weight_count[target] = []
                     uid_weight_count[target].append((vuid, weight))
 
-        top_miners = sorted(uid_weight_count.items(), key=lambda x: len(x[1]), reverse=True)
+        # Include UIDs with weight=0 too (they were set but zero)
+        for vuid, w_list in weights.items():
+            for target, weight in w_list:
+                if weight == 0 and target not in uid_weight_count:
+                    uid_weight_count[target] = [(vuid, 0)]
+
+        top_miners = sorted(uid_weight_count.items(), key=lambda x: (-len(x[1]), -sum(w for _, w in x[1])))
         if top_miners:
-            console.print(f"\n    [bold]Top miners by validator count:[/bold]")
-            for uid, vals in top_miners[:10]:
-                avg_w = sum(w for _, w in vals) / len(vals) / 65535 * 100
-                marker = " [bold green]★ YOURS[/bold green]" if uid in our_uids else ""
-                hk = hk_list[uid][:12] if uid < len(hk_list) else "?"
-                console.print(f"      UID {uid:>3} ({hk}...): {len(vals)} validators, avg {avg_w:.1f}%{marker}")
+            table = Table(title="Miners receiving weights", show_lines=True)
+            table.add_column("UID", style="cyan", justify="right")
+            table.add_column("Validators", justify="right")
+            table.add_column("Avg Weight", justify="right")
+            table.add_column("Ours", justify="center")
+            table.add_column("Hotkey", style="dim")
 
-    # Current epoch
-    current_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
-    display_epoch_weights(current_weights, f"Current epoch (block {current_block})")
+            for uid, vals in top_miners[:15]:
+                non_zero = [(v, w) for v, w in vals if w > 0]
+                avg_w = sum(w for _, w in non_zero) / len(non_zero) / 65535 * 100 if non_zero else 0.0
+                is_ours = uid in our_uids
+                ours_mark = "[bold green]★[/bold green]" if is_ours else ""
+                hk = hk_list[uid][:20] + "..." if uid < len(hk_list) else "?"
+                table.add_row(
+                    str(uid),
+                    str(len(non_zero)),
+                    f"{avg_w:.1f}%",
+                    ours_mark,
+                    hk,
+                )
+            console.print(table)
 
-    # Historical epochs
-    if num_epochs > 1:
-        console.print(f"\n  [dim]Connecting to archive node...[/dim]")
+    # Epoch 0 = current state (at last_step block via archive, or live)
+    # Epoch -1 = last_step - tempo
+    # etc.
+    epoch_blocks = [last_step - (tempo * i) for i in range(num_epochs)]
+    epoch_blocks = [b for b in epoch_blocks if b > 0]
+
+    if num_epochs == 1:
+        # Just current live state
+        current_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
+        display_epoch_weights(current_weights, f"Current weights (block {current_block})")
+        final_weights = current_weights
+    else:
+        # Use archive node for all epochs
+        console.print(f"\n  [dim]Connecting to archive node for {len(epoch_blocks)} epochs...[/dim]")
+        final_weights = {}
         try:
             archive = AsyncSubstrateInterface(url=ARCHIVE_URL, ss58_format=42)
             await archive.initialize()
 
-            for epoch_i in range(1, num_epochs):
-                epoch_block = last_step - (tempo * epoch_i)
-                if epoch_block <= 0:
-                    break
+            for i, epoch_block in enumerate(epoch_blocks):
+                epoch_label = "Current epoch" if i == 0 else f"Epoch -{i}"
                 try:
                     block_hash = await archive.get_block_hash(epoch_block)
                     if not block_hash:
+                        print_error(f"Could not get block hash for {epoch_block}")
                         continue
                     epoch_weights = await get_weights_for_epoch(archive, netuid, val_uids, block_hash)
-                    display_epoch_weights(epoch_weights, f"Epoch -{epoch_i} (block {epoch_block})")
+                    display_epoch_weights(epoch_weights, f"{epoch_label} (block {epoch_block})")
+                    if i == 0:
+                        final_weights = epoch_weights
                 except Exception as e:
-                    print_error(f"Epoch -{epoch_i} failed: {e}")
+                    print_error(f"{epoch_label} failed: {e}")
 
             await archive.close()
         except Exception as e:
             print_error(f"Archive connection failed: {e}")
+            # Fallback to live query
+            console.print(f"  [dim]Falling back to live node...[/dim]")
+            final_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
+            display_epoch_weights(final_weights, f"Current weights (block {current_block})")
 
     # Our UIDs summary
     if our_uids:
-        console.print(f"\n  [bold cyan]═══ Your UIDs Weight Summary ═══[/bold cyan]")
+        console.print(f"\n  [bold cyan]═══ Your UIDs Weight Summary ({len(our_uids)} UIDs) ═══[/bold cyan]")
+        with_weights = 0
+        without_weights = 0
         for uid in sorted(our_uids):
             received_from = []
-            for vuid, w_list in current_weights.items():
+            for vuid, w_list in final_weights.items():
                 for target, weight in w_list:
                     if target == uid and weight > 0:
                         received_from.append((vuid, weight))
             if received_from:
                 vals_str = ", ".join([f"Val{v}={w/65535*100:.1f}%" for v, w in received_from])
-                print_success(f"UID {uid:>3} ({hk_list[uid][:16]}...): {len(received_from)} validators — {vals_str}")
+                print_success(f"UID {uid:>3}: {len(received_from)} validators — {vals_str}")
+                with_weights += 1
             else:
-                print_warn(f"UID {uid:>3} ({hk_list[uid][:16]}...): NO weights from any validator")
+                without_weights += 1
+
+        if without_weights > 0:
+            print_warn(f"{without_weights} of your UIDs have NO weights from any validator")
+        if with_weights > 0:
+            print_success(f"{with_weights} of your UIDs ARE receiving weights")
 
 
 # ========================================================================
