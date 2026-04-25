@@ -2055,46 +2055,35 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
                 )
             console.print(table)
 
-    # Epoch 0 = current state (at last_step block via archive, or live)
-    # Epoch -1 = last_step - tempo
-    # etc.
-    epoch_blocks = [last_step - (tempo * i) for i in range(num_epochs)]
-    epoch_blocks = [b for b in epoch_blocks if b > 0]
+    # Always get current weights from live node
+    current_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
+    display_epoch_weights(current_weights, f"Current weights (block {current_block})")
+    final_weights = current_weights
 
-    if num_epochs == 1:
-        # Just current live state
-        current_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
-        display_epoch_weights(current_weights, f"Current weights (block {current_block})")
-        final_weights = current_weights
-    else:
-        # Use archive node for all epochs
-        console.print(f"\n  [dim]Connecting to archive node for {len(epoch_blocks)} epochs...[/dim]")
-        final_weights = {}
+    # Historical epochs via archive node
+    if num_epochs > 1:
+        console.print(f"\n  [dim]Connecting to archive node for {num_epochs - 1} past epochs...[/dim]")
         try:
             archive = AsyncSubstrateInterface(url=ARCHIVE_URL, ss58_format=42)
             await archive.initialize()
 
-            for i, epoch_block in enumerate(epoch_blocks):
-                epoch_label = "Current epoch" if i == 0 else f"Epoch -{i}"
+            for i in range(1, num_epochs):
+                epoch_block = last_step - (tempo * i)
+                if epoch_block <= 0:
+                    break
                 try:
                     block_hash = await archive.get_block_hash(epoch_block)
                     if not block_hash:
-                        print_error(f"Could not get block hash for {epoch_block}")
+                        print_error(f"Could not get block hash for block {epoch_block}")
                         continue
                     epoch_weights = await get_weights_for_epoch(archive, netuid, val_uids, block_hash)
-                    display_epoch_weights(epoch_weights, f"{epoch_label} (block {epoch_block})")
-                    if i == 0:
-                        final_weights = epoch_weights
+                    display_epoch_weights(epoch_weights, f"Epoch -{i} (block {epoch_block})")
                 except Exception as e:
-                    print_error(f"{epoch_label} failed: {e}")
+                    print_error(f"Epoch -{i} failed: {e}")
 
             await archive.close()
         except Exception as e:
             print_error(f"Archive connection failed: {e}")
-            # Fallback to live query
-            console.print(f"  [dim]Falling back to live node...[/dim]")
-            final_weights = await get_weights_for_epoch(client.substrate, netuid, val_uids)
-            display_epoch_weights(final_weights, f"Current weights (block {current_block})")
 
     # Our UIDs summary
     if our_uids:
