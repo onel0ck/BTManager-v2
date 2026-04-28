@@ -515,8 +515,16 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
 # ========================================================================
 
 async def handle_register(client: SubstrateClient, config: dict):
-    print_header("Burn Registration")
+    print_header("Registration & Hotkey Management")
     base_path = config["wallet"]["base_path"]
+
+    console.print("  [cyan]1.[/cyan] Burn register")
+    console.print("  [cyan]2.[/cyan] Swap hotkey (transfer UID to another hotkey)")
+    reg_mode = Prompt.ask("Select", choices=["1", "2"], default="1")
+
+    if reg_mode == "2":
+        await _swap_hotkey(client, base_path)
+        return
 
     w = select_single_wallet(base_path)
     if not w:
@@ -584,6 +592,126 @@ async def handle_register(client: SubstrateClient, config: dict):
             print_success(f"Registered on SN{netuid}! UID: {uid}")
         else:
             print_error(f"Registration failed: {error}")
+
+
+async def _swap_hotkey(client, base_path):
+    """Swap hotkey on a subnet — transfer UID from one hotkey to another on same coldkey."""
+    w = select_single_wallet(base_path, "Select wallet (coldkey)")
+    if not w:
+        return
+
+    netuid = IntPrompt.ask("Subnet ID (netuid)")
+
+    # Show registered hotkeys on this subnet
+    console.print(f"  [dim]Checking registered hotkeys on SN{netuid}...[/dim]")
+    from bittensor_wallet import Wallet
+
+    registered_hks = []  # (hk_name, hk_ss58, uid)
+    all_hks = []  # (hk_name, hk_ss58)
+    for hk_name in (w.get("hotkeys") or []):
+        try:
+            hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
+            hk_ss58 = hw.hotkey.ss58_address
+            all_hks.append((hk_name, hk_ss58))
+            uid = await client.get_uid_for_hotkey_on_subnet(netuid, hk_ss58)
+            if uid is not None:
+                registered_hks.append((hk_name, hk_ss58, uid))
+        except Exception:
+            continue
+
+    if not registered_hks:
+        print_error(f"No registered hotkeys on SN{netuid} for {w['name']}")
+        return
+
+    console.print(f"\n  Registered hotkeys on SN{netuid}:")
+    for i, (hk_name, hk_ss58, uid) in enumerate(registered_hks, 1):
+        console.print(f"    [cyan]{i}.[/cyan] HK {hk_name} (UID {uid}) — {hk_ss58[:20]}...")
+
+    # Select old hotkey (source — has the UID)
+    old_input = Prompt.ask("  Select source hotkey (has UID to transfer)")
+    try:
+        idx = int(old_input)
+        if 1 <= idx <= len(registered_hks):
+            old_hk_name, old_hk_ss58, old_uid = registered_hks[idx - 1]
+        else:
+            print_error("Invalid selection")
+            return
+    except ValueError:
+        # Try by name
+        match = [(n, s, u) for n, s, u in registered_hks if n == old_input]
+        if match:
+            old_hk_name, old_hk_ss58, old_uid = match[0]
+        else:
+            print_error(f"Hotkey '{old_input}' not found")
+            return
+
+    console.print(f"  Source: HK [cyan]{old_hk_name}[/cyan] (UID {old_uid})")
+
+    # Select new hotkey (destination — must NOT be registered on this subnet)
+    console.print(f"\n  Available hotkeys (not registered on SN{netuid}):")
+    registered_ss58 = {s for _, s, _ in registered_hks}
+    unregistered_hks = [(n, s) for n, s in all_hks if s not in registered_ss58]
+
+    if not unregistered_hks:
+        print_error("No unregistered hotkeys available for swap destination")
+        return
+
+    for i, (hk_name, hk_ss58) in enumerate(unregistered_hks, 1):
+        console.print(f"    [cyan]{i}.[/cyan] HK {hk_name} — {hk_ss58[:20]}...")
+
+    new_input = Prompt.ask("  Select destination hotkey")
+    try:
+        idx = int(new_input)
+        if 1 <= idx <= len(unregistered_hks):
+            new_hk_name, new_hk_ss58 = unregistered_hks[idx - 1]
+        else:
+            print_error("Invalid selection")
+            return
+    except ValueError:
+        match = [(n, s) for n, s in unregistered_hks if n == new_input]
+        if match:
+            new_hk_name, new_hk_ss58 = match[0]
+        else:
+            print_error(f"Hotkey '{new_input}' not found")
+            return
+
+    console.print(f"  Destination: HK [cyan]{new_hk_name}[/cyan] ({new_hk_ss58[:20]}...)")
+
+    # Keep stake option
+    keep_stake = Confirm.ask("  Keep stake on old hotkey?", default=False)
+
+    console.print(f"\n  [bold]Swap summary:[/bold]")
+    console.print(f"    Subnet: SN{netuid}")
+    console.print(f"    From: HK {old_hk_name} (UID {old_uid})")
+    console.print(f"    To: HK {new_hk_name}")
+    console.print(f"    Keep stake: {'Yes' if keep_stake else 'No (transfer stake)'}")
+
+    if not Confirm.ask("Proceed with hotkey swap?"):
+        return
+
+    console.print("  [dim]Unlocking coldkey...[/dim]")
+    wallet = load_wallet(w["name"], old_hk_name, base_path)
+    _ = wallet.coldkey
+
+    console.print("  [dim]Submitting swap_hotkey_v2...[/dim]")
+    try:
+        success, error = await client.compose_and_submit_checked(
+            call_module="SubtensorModule",
+            call_function="swap_hotkey_v2",
+            call_params={
+                "hotkey": old_hk_ss58,
+                "new_hotkey": new_hk_ss58,
+                "netuid": netuid,
+                "keep_stake": keep_stake,
+            },
+            keypair=wallet.coldkey,
+        )
+        if success:
+            print_success(f"Swapped! UID {old_uid}: HK {old_hk_name} → HK {new_hk_name}")
+        else:
+            print_error(f"Swap failed: {error}")
+    except Exception as e:
+        print_error(f"Swap failed: {e}")
 
 
 # ========================================================================
