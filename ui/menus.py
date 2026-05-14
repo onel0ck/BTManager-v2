@@ -313,17 +313,20 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
     console.print(f"  [dim]Cached {len(neuron_cache)} hotkeys[/dim]")
 
     all_stats = []
+
+    # Phase 1: Pre-load all hotkey maps (disk I/O, synchronous but fast)
+    console.print(f"  [dim]Loading hotkey data for {len(selected)} wallets...[/dim]")
+    from bittensor_wallet import Wallet
+    import time
+    t0 = time.time()
+
+    wallet_data = []  # (name, addr, hotkey_ss58_list, hotkey_name_map)
     for w in selected:
         addr = get_coldkey_ss58(w["name"], base_path)
         if not addr:
-            print_warn(f"Could not load address for {w['name']}")
             continue
-        console.print(f"  Loading stats for [cyan]{w['name']}[/cyan]...")
-
-        # Load hotkey SS58 addresses for registration checks
         hotkey_ss58_list = []
-        hotkey_name_map = {}  # ss58 -> hotkey name
-        from bittensor_wallet import Wallet
+        hotkey_name_map = {}
         for hk_name in (w.get("hotkeys") or []):
             try:
                 hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
@@ -332,14 +335,33 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
                 hotkey_name_map[hk_ss58] = hk_name
             except Exception:
                 pass
+        wallet_data.append((w["name"], addr, hotkey_ss58_list, hotkey_name_map))
 
-        stats = await get_wallet_stats(
+    t1 = time.time()
+    console.print(f"  [dim]Loaded {sum(len(d[2]) for d in wallet_data)} hotkeys in {t1-t0:.1f}s[/dim]")
+
+    # Phase 2: Fetch all wallet stats in parallel
+    console.print(f"  [dim]Fetching stats for {len(wallet_data)} wallets in parallel...[/dim]")
+
+    async def fetch_one(name, addr, hk_list, hk_map):
+        return (name, await get_wallet_stats(
             client, addr, include_usd=show_usd,
-            hotkey_ss58_list=hotkey_ss58_list,
+            hotkey_ss58_list=hk_list,
             neuron_cache=neuron_cache,
-            hotkey_name_map=hotkey_name_map,
-        )
-        all_stats.append((w["name"], stats))
+            hotkey_name_map=hk_map,
+        ))
+
+    tasks = [fetch_one(name, addr, hk_list, hk_map) for name, addr, hk_list, hk_map in wallet_data]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, Exception):
+            print_error(f"Stats failed: {r}")
+        else:
+            all_stats.append(r)
+
+    t2 = time.time()
+    console.print(f"  [dim]Stats loaded in {t2-t1:.1f}s (total {t2-t0:.1f}s)[/dim]")
 
     if all_stats:
         display_multi_wallet_stats(all_stats)
