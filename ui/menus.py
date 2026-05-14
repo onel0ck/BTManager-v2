@@ -387,85 +387,123 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
 
     from bittensor_wallet import Wallet
     from core.substrate_client import rao_to_tao, decode_price
+    from core.stats import decode_ss58
     from ui.display import BLOCKS_PER_DAY
+    import time
 
-    # Get subnet dynamic info for price and tempo
-    dynamic_info = await client.get_subnet_dynamic_info(netuid)
+    t0 = time.time()
+
+    # Phase 1: Get subnet info, neurons, and TAO price in parallel
+    console.print(f"  [dim]Loading subnet data...[/dim]")
+    dynamic_task = client.get_subnet_dynamic_info(netuid)
+    neurons_task = client.get_neurons_lite(netuid)
+    price_task = fetch_tao_price()
+
+    dynamic_info, neurons_raw, tao_price = await asyncio.gather(
+        dynamic_task, neurons_task, price_task, return_exceptions=True
+    )
+
     moving_price = 0.0
     tempo = 360
-    if dynamic_info:
+    if not isinstance(dynamic_info, Exception) and dynamic_info:
         moving_price = decode_price(dynamic_info.get("moving_price", 0))
         tempo = dynamic_info.get("tempo", 360)
+    if isinstance(tao_price, Exception):
+        tao_price = None
 
-    tao_price = await fetch_tao_price()
-
-    # Get neurons for emission data
-    neurons_map = {}  # hotkey_ss58 -> neuron_data
-    try:
-        neurons = await client.get_neurons_lite(netuid)
-        for n in neurons:
+    # Build neurons map (hotkey_ss58 -> neuron_data with uid)
+    neurons_map = {}
+    if not isinstance(neurons_raw, Exception) and neurons_raw:
+        for n in neurons_raw:
             if isinstance(n, dict):
-                from core.stats import decode_ss58
                 hk = decode_ss58(n.get("hotkey", ""))
                 neurons_map[hk] = n
-    except Exception:
-        pass
 
-    # Get stake info per coldkey
-    coldkey_stakes = {}  # coldkey_ss58 -> {hotkey_ss58: alpha_rao}
+    t1 = time.time()
+    console.print(f"  [dim]Subnet data loaded in {t1-t0:.1f}s ({len(neurons_map)} neurons)[/dim]")
+
+    # Phase 2: Load all hotkey SS58 addresses from disk (sync, fast)
+    console.print(f"  [dim]Loading hotkey addresses from {len(selected)} wallets...[/dim]")
+    all_hotkey_entries = []  # (wallet_name, hk_name, hk_ss58, coldkey_ss58)
     for w in selected:
         addr = get_coldkey_ss58(w["name"], base_path)
         if not addr:
             continue
+        for hk_name in (w.get("hotkeys") or []):
+            try:
+                hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
+                all_hotkey_entries.append((w["name"], hk_name, hw.hotkey.ss58_address, addr))
+            except Exception:
+                continue
+
+    t2 = time.time()
+    console.print(f"  [dim]Loaded {len(all_hotkey_entries)} hotkeys in {t2-t1:.1f}s[/dim]")
+
+    # Phase 3: Match against neurons_map (instant, no RPC)
+    # Also fetch stake info for coldkeys that have registered hotkeys (parallel)
+    registered_coldkeys = set()
+    registered = []
+    not_registered_wallets = []
+    wallet_has_reg = {}
+
+    for wname, hk_name, hk_ss58, ck_ss58 in all_hotkey_entries:
+        neuron = neurons_map.get(hk_ss58)
+        if neuron is None:
+            continue  # Not registered
+        uid = neuron.get("uid", None)
+        if uid is None:
+            continue
+        registered_coldkeys.add(ck_ss58)
+        wallet_has_reg[wname] = True
+        registered.append((wname, hk_name, hk_ss58, uid, ck_ss58, neuron))
+
+    # Wallets without registrations
+    for w in selected:
+        if w["name"] not in wallet_has_reg:
+            not_registered_wallets.append(w["name"])
+
+    # Phase 4: Fetch stake info for registered coldkeys in parallel
+    console.print(f"  [dim]Fetching stake data for {len(registered_coldkeys)} coldkeys...[/dim]")
+    coldkey_stakes = {}
+
+    async def fetch_stakes(ck):
         try:
-            stakes = await client.get_stake_info_for_coldkey(addr)
+            stakes = await client.get_stake_info_for_coldkey(ck)
             stake_map = {}
             for entry in stakes:
                 if not isinstance(entry, dict):
                     continue
                 if entry.get("netuid", 0) != netuid:
                     continue
-                from core.stats import decode_ss58
                 hk = decode_ss58(entry.get("hotkey", ""))
                 stake_map[hk] = entry.get("stake", 0)
-            coldkey_stakes[addr] = stake_map
+            return (ck, stake_map)
         except Exception:
-            coldkey_stakes[addr] = {}
+            return (ck, {})
 
-    # Check registrations
-    registered = []  # list of (wallet_name, hotkey_name, hotkey_ss58, uid, alpha_tao, tao_value, daily_tao, incentive)
-    not_registered_wallets = []
+    stake_results = await asyncio.gather(*[fetch_stakes(ck) for ck in registered_coldkeys])
+    for ck, smap in stake_results:
+        coldkey_stakes[ck] = smap
 
-    for w in selected:
-        addr = get_coldkey_ss58(w["name"], base_path)
-        wallet_has_reg = False
-        for hk_name in (w.get("hotkeys") or []):
-            try:
-                hw = Wallet(name=w["name"], hotkey=hk_name, path=base_path)
-                hk_ss58 = hw.hotkey.ss58_address
-                uid = await client.get_uid_for_hotkey_on_subnet(netuid, hk_ss58)
-                if uid is None:
-                    continue
+    t3 = time.time()
+    console.print(f"  [dim]All data ready in {t3-t0:.1f}s[/dim]")
 
-                # Stake
-                alpha_rao = coldkey_stakes.get(addr, {}).get(hk_ss58, 0)
-                alpha_tao = rao_to_tao(alpha_rao)
-                tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
+    # Phase 5: Build final registered list with stake/emission data
+    final_registered = []
+    for wname, hk_name, hk_ss58, uid, ck_ss58, neuron in registered:
+        alpha_rao = coldkey_stakes.get(ck_ss58, {}).get(hk_ss58, 0)
+        alpha_tao = rao_to_tao(alpha_rao)
+        tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
 
-                # Emission from neuron data
-                neuron = neurons_map.get(hk_ss58, {})
-                emission_alpha_per_tempo = rao_to_tao(neuron.get("emission", 0))
-                emission_tao_per_tempo = emission_alpha_per_tempo * moving_price if moving_price > 0 else 0.0
-                emission_tao_per_block = emission_tao_per_tempo / tempo if tempo > 0 else 0.0
-                daily_tao = emission_tao_per_block * BLOCKS_PER_DAY
-                incentive = neuron.get("incentive", 0)
+        emission_alpha_per_tempo = rao_to_tao(neuron.get("emission", 0))
+        emission_tao_per_tempo = emission_alpha_per_tempo * moving_price if moving_price > 0 else 0.0
+        emission_tao_per_block = emission_tao_per_tempo / tempo if tempo > 0 else 0.0
+        daily_tao = emission_tao_per_block * BLOCKS_PER_DAY
+        incentive = neuron.get("incentive", 0)
 
-                registered.append((w["name"], hk_name, hk_ss58, uid, alpha_tao, tao_value, daily_tao, incentive))
-                wallet_has_reg = True
-            except Exception:
-                continue
-        if not wallet_has_reg:
-            not_registered_wallets.append(w["name"])
+        final_registered.append((wname, hk_name, hk_ss58, uid, alpha_tao, tao_value, daily_tao, incentive))
+
+    registered = final_registered
 
     # Display table
     if registered:
