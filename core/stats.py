@@ -120,6 +120,8 @@ async def get_wallet_stats(
     hotkey_ss58_list: list = None,
     neuron_cache: dict = None,
     hotkey_name_map: dict = None,
+    shared_dynamic: list = None,
+    shared_price: float = None,
 ) -> dict:
     """
     Get comprehensive wallet stats.
@@ -128,13 +130,17 @@ async def get_wallet_stats(
         neuron_cache: pre-built {hotkey -> [{netuid, uid, emission, ...}]} from build_global_neuron_cache()
                       emission values are alpha RAO per tempo.
         hotkey_name_map: optional {hotkey_ss58: hotkey_name} for display purposes.
+        shared_dynamic: pre-fetched dynamic info (avoids redundant RPC call per wallet).
+        shared_price: pre-fetched TAO price (avoids redundant API call per wallet).
     """
     tasks = {
         "balance": client.get_balance(coldkey_ss58),
         "stakes": client.get_stake_info_for_coldkey(coldkey_ss58),
-        "dynamic": client.get_all_dynamic_info(),
     }
-    if include_usd:
+    # Only fetch dynamic/price if not pre-provided
+    if shared_dynamic is None:
+        tasks["dynamic"] = client.get_all_dynamic_info()
+    if shared_price is None and include_usd:
         tasks["price"] = fetch_tao_price()
 
     results = {}
@@ -144,6 +150,12 @@ async def get_wallet_stats(
         except Exception as e:
             logger.error(f"Failed to fetch {key}: {e}")
             results[key] = None
+
+    # Use shared data if provided
+    if shared_dynamic is not None:
+        results["dynamic"] = shared_dynamic
+    if shared_price is not None:
+        results["price"] = shared_price
 
     price_map = {}
     name_map = {}

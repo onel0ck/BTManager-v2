@@ -312,6 +312,11 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
     neuron_cache = await build_global_neuron_cache(client)
     console.print(f"  [dim]Cached {len(neuron_cache)} hotkeys[/dim]")
 
+    # Pre-fetch shared data once (avoids redundant calls per wallet)
+    console.print("  [dim]Fetching subnet prices and TAO price...[/dim]")
+    shared_dynamic = await client.get_all_dynamic_info()
+    shared_price = await fetch_tao_price() if show_usd else None
+
     all_stats = []
 
     # Phase 1: Pre-load all hotkey maps (disk I/O, synchronous but fast)
@@ -349,6 +354,8 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
             hotkey_ss58_list=hk_list,
             neuron_cache=neuron_cache,
             hotkey_name_map=hk_map,
+            shared_dynamic=shared_dynamic,
+            shared_price=shared_price,
         ))
 
     tasks = [fetch_one(name, addr, hk_list, hk_map) for name, addr, hk_list, hk_map in wallet_data]
