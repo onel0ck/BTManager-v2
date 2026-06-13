@@ -1,4 +1,3 @@
-
 """
 Interactive menu system using Rich.
 """
@@ -440,30 +439,24 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
     console.print(f"  [dim]Loaded {len(all_hotkey_entries)} hotkeys in {t2-t1:.1f}s[/dim]")
 
     # Phase 3: Match against neurons_map (instant, no RPC)
-    # Also fetch stake info for coldkeys that have registered hotkeys (parallel)
-    registered_coldkeys = set()
     registered = []
-    not_registered_wallets = []
     wallet_has_reg = {}
+    all_coldkeys = {}  # ck_ss58 -> wallet_name (for stake fetch)
 
     for wname, hk_name, hk_ss58, ck_ss58 in all_hotkey_entries:
+        all_coldkeys[ck_ss58] = wname
         neuron = neurons_map.get(hk_ss58)
         if neuron is None:
-            continue  # Not registered
+            continue  # Not registered (will check stake later)
         uid = neuron.get("uid", None)
         if uid is None:
             continue
-        registered_coldkeys.add(ck_ss58)
         wallet_has_reg[wname] = True
         registered.append((wname, hk_name, hk_ss58, uid, ck_ss58, neuron))
 
-    # Wallets without registrations
-    for w in selected:
-        if w["name"] not in wallet_has_reg:
-            not_registered_wallets.append(w["name"])
-
-    # Phase 4: Fetch stake info for registered coldkeys in parallel
-    console.print(f"  [dim]Fetching stake data for {len(registered_coldkeys)} coldkeys...[/dim]")
+    # Phase 4: Fetch stake info for ALL coldkeys in parallel
+    # (so we can detect deregistered hotkeys that still hold alpha)
+    console.print(f"  [dim]Fetching stake data for {len(all_coldkeys)} coldkeys...[/dim]")
     coldkey_stakes = {}
 
     async def fetch_stakes(ck):
@@ -481,7 +474,7 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         except Exception:
             return (ck, {})
 
-    stake_results = await asyncio.gather(*[fetch_stakes(ck) for ck in registered_coldkeys])
+    stake_results = await asyncio.gather(*[fetch_stakes(ck) for ck in all_coldkeys])
     for ck, smap in stake_results:
         coldkey_stakes[ck] = smap
 
@@ -490,7 +483,9 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
 
     # Phase 5: Build final registered list with stake/emission data
     final_registered = []
+    registered_hk_set = set()
     for wname, hk_name, hk_ss58, uid, ck_ss58, neuron in registered:
+        registered_hk_set.add(hk_ss58)
         alpha_rao = coldkey_stakes.get(ck_ss58, {}).get(hk_ss58, 0)
         alpha_tao = rao_to_tao(alpha_rao)
         tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
@@ -502,6 +497,24 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         incentive = neuron.get("incentive", 0)
 
         final_registered.append((wname, hk_name, hk_ss58, uid, alpha_tao, tao_value, daily_tao, incentive))
+
+    # Phase 5b: Find deregistered hotkeys that still hold alpha stake
+    deregistered = []  # (wname, hk_name, hk_ss58, alpha_tao, tao_value)
+    for wname, hk_name, hk_ss58, ck_ss58 in all_hotkey_entries:
+        if hk_ss58 in registered_hk_set:
+            continue  # already shown as registered
+        alpha_rao = coldkey_stakes.get(ck_ss58, {}).get(hk_ss58, 0)
+        if alpha_rao and alpha_rao > 0:
+            alpha_tao = rao_to_tao(alpha_rao)
+            tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
+            deregistered.append((wname, hk_name, hk_ss58, alpha_tao, tao_value))
+            wallet_has_reg[wname] = True  # has alpha here, not "not registered"
+
+    # Wallets without any registration or stake
+    not_registered_wallets = []
+    for w in selected:
+        if w["name"] not in wallet_has_reg:
+            not_registered_wallets.append(w["name"])
 
     registered = final_registered
 
@@ -555,10 +568,42 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         else:
             console.print()
 
+    # Deregistered hotkeys that still hold alpha
+    if deregistered:
+        console.print(f"\n  [bold yellow]Deregistered hotkeys still holding alpha on SN{netuid}:[/bold yellow]")
+        dtable = Table(show_lines=True)
+        dtable.add_column("Wallet", style="cyan")
+        dtable.add_column("HK", style="bold white", justify="right")
+        dtable.add_column("α Stake", justify="right", style="yellow")
+        dtable.add_column("τ Value", justify="right", style="green")
+        if tao_price:
+            dtable.add_column("USD", justify="right", style="yellow")
+        dtable.add_column("Hotkey", style="dim", no_wrap=True)
+
+        d_total_alpha = 0.0
+        d_total_value = 0.0
+        for wname, hk_name, hk_ss58, alpha_tao, tao_value in sorted(deregistered, key=lambda x: -x[3]):
+            row = [wname, hk_name, f"{alpha_tao:.4f}", f"{tao_value:.4f}"]
+            if tao_price:
+                row.append(f"${tao_value * tao_price:,.2f}")
+            row.append(hk_ss58)
+            dtable.add_row(*row)
+            d_total_alpha += alpha_tao
+            d_total_value += tao_value
+        console.print(dtable)
+        console.print(f"  Deregistered α: [yellow]{d_total_alpha:.4f}[/yellow], τ value: [green]{d_total_value:.4f}[/green]", end="")
+        if tao_price:
+            console.print(f" [yellow](${d_total_value * tao_price:,.2f})[/yellow]")
+        else:
+            console.print()
+        print_info("These can be unstaked via Unstake mode (specific subnet)")
+
     # Summary
     unique_wallets = sorted(set(wname for wname, _, _, _, _, _, _, _ in registered))
     console.print(f"\n  [bold]Summary SN{netuid}:[/bold]")
     console.print(f"  Registered: [green]{len(registered)} hotkeys[/green] across [green]{len(unique_wallets)} wallets[/green]")
+    if deregistered:
+        console.print(f"  Deregistered with alpha: [yellow]{len(deregistered)} hotkeys[/yellow]")
     if not_registered_wallets:
         console.print(f"  Not registered: [red]{len(not_registered_wallets)} wallets[/red]")
 
