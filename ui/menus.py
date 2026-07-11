@@ -1800,12 +1800,38 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
     )
 
     if success:
-        print_success(f"Staked {amount_tao:.6f} TAO on SN{netuid}!")
-        if base_price > 0:
-            console.print(
-                f"  Expected ~{amount_tao / base_price:.4f} {alpha_symbol} — "
-                f"check Wallet Stats to verify"
+        print_success(f"Staked on SN{netuid}! Checking actual result...")
+        # Query real outcome: TAO spent + alpha received
+        try:
+            new_bal, new_stake_rao = await asyncio.gather(
+                check_balance(client, ck_addr),
+                client.get_stake_for_hotkey_coldkey_netuid(hotkey_ss58, ck_addr, netuid),
             )
+            tao_spent = bal["free_tao"] - new_bal["free_tao"]
+            alpha_received = rao_to_tao(new_stake_rao)
+
+            console.print(f"  TAO spent   : [yellow]{tao_spent:.6f} TAO[/yellow]", end="")
+            if tao_spent < amount_tao - 0.000001:
+                pct = tao_spent / amount_tao * 100
+                console.print(f"  [dim](partial fill: {pct:.1f}% of {amount_tao:.4f} requested)[/dim]")
+            else:
+                console.print()
+            console.print(f"  {alpha_symbol} received : [green]{alpha_received:.4f} {alpha_symbol}[/green]", end="")
+            if tao_spent > 0:
+                actual_rate = tao_spent / alpha_received if alpha_received > 0 else 0
+                console.print(f"  [dim](rate: {1/actual_rate:.4f} {alpha_symbol}/TAO)[/dim]" if actual_rate > 0 else "")
+            else:
+                console.print()
+            if tao_price and alpha_received > 0:
+                usd_val = alpha_received * base_price * tao_price
+                console.print(f"  USD value   : [dim]~${usd_val:.2f}[/dim]")
+        except Exception:
+            # Fallback if post-tx query fails
+            if base_price > 0:
+                console.print(
+                    f"  Expected ~{amount_tao / base_price:.4f} {alpha_symbol} — "
+                    f"check Wallet Stats to verify"
+                )
     else:
         print_error(f"Staking failed: {error}")
 
