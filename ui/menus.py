@@ -6,14 +6,14 @@ import asyncio
 from rich.prompt import Prompt, IntPrompt, Confirm, FloatPrompt
 from rich.table import Table
 
-from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao
+from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao, decode_price, decode_bytes
 from core.wallet_ops import (
     list_wallets, load_wallet, get_coldkey_ss58,
     create_coldkey_with_hotkeys, add_hotkeys_to_wallet, create_hotkey,
     batch_create_wallets,
 )
 from core.balance import check_balance, check_all_balances
-from core.staking import remove_stake, unstake_all, unstake_subnet
+from core.staking import add_stake, remove_stake, unstake_all, unstake_subnet
 from core.registration import burn_register, get_registration_info, check_registration_status
 from core.transfer import transfer_tao, transfer_tao_keep_alive
 from core.stats import get_wallet_stats, get_subnet_overview, fetch_tao_price
@@ -33,8 +33,11 @@ MENU_OPTIONS = [
     ("6", "Unstake"),
     ("7", "Subnet Info"),
     ("8", "Wallet Groups"),
+    ("9", "Add Stake"),
     ("0", "Exit"),
 ]
+
+TAOSTATS_VALIDATOR = "5GKH9FPPnWSUoeeTJp19wVtd84XqFW4pyK2ijV2GsFbhTrP1"
 
 
 def show_main_menu():
@@ -1564,6 +1567,238 @@ async def _transfer_distribute_alpha(client, base_path):
 
 
 # ========================================================================
+# 9. Add Stake
+# ========================================================================
+
+async def handle_add_stake(client: SubstrateClient, config: dict):
+    print_header("Add Stake")
+    base_path = config["wallet"]["base_path"]
+
+    DEFAULT_SLIPPAGE_PCT = 1.0  # 1% — tight slippage for MEV protection
+
+    # ── 1. Coldkey selection ──────────────────────────────────────────────
+    w = select_single_wallet(base_path, "Select coldkey (staker)")
+    if not w:
+        return
+
+    wallet = load_wallet(w["name"], base_path=base_path)
+    ck_addr = wallet.coldkeypub.ss58_address
+    bal = await check_balance(client, ck_addr)
+    console.print(f"  Coldkey: [cyan]{w['name']}[/cyan] ({ck_addr[:20]}...)")
+    console.print(f"  Free balance: [green]{bal['free_tao']:.6f} TAO[/green]")
+    if bal["free_tao"] < 0.001:
+        print_error("Insufficient TAO balance")
+        return
+
+    # ── 2. Subnet ─────────────────────────────────────────────────────────
+    netuid = IntPrompt.ask("  Subnet ID (netuid)")
+
+    # ── 3. Fetch price + TAO/USD in parallel ──────────────────────────────
+    console.print(f"  [dim]Fetching SN{netuid} info...[/dim]")
+    dynamic_info, tao_price = await asyncio.gather(
+        client.get_subnet_dynamic_info(netuid),
+        fetch_tao_price(),
+        return_exceptions=True,
+    )
+    if isinstance(dynamic_info, Exception):
+        dynamic_info = None
+    if isinstance(tao_price, Exception):
+        tao_price = None
+
+    moving_price = 0.0
+    alpha_symbol = "alpha"
+    subnet_name = f"SN{netuid}"
+    if dynamic_info:
+        moving_price = decode_price(dynamic_info.get("moving_price", 0))
+        raw_sym = dynamic_info.get("token_symbol", b"")
+        if raw_sym:
+            alpha_symbol = decode_bytes(raw_sym) or "alpha"
+        raw_name = dynamic_info.get("subnet_name", b"")
+        if raw_name:
+            subnet_name = decode_bytes(raw_name) or f"SN{netuid}"
+
+    alpha_per_tao = (1.0 / moving_price) if moving_price > 0 else None
+
+    if alpha_per_tao:
+        console.print(
+            f"  [bold]SN{netuid} — {subnet_name} ({alpha_symbol})[/bold]"
+        )
+        console.print(
+            f"  Price: [yellow]1 TAO = {alpha_per_tao:.4f} {alpha_symbol}[/yellow]"
+            f"  |  1 {alpha_symbol} = {moving_price:.6f} TAO"
+        )
+        if tao_price:
+            usd_per_alpha = moving_price * tao_price
+            console.print(f"  ({alpha_symbol}: ~${usd_per_alpha:.4f} USD | TAO: ~${tao_price:.2f} USD)")
+    else:
+        print_warn("Could not fetch current price — proceeding without estimates")
+
+    # ── 4. Hotkey (validator) selection ───────────────────────────────────
+    console.print("\n  [bold]Destination hotkey (validator to delegate to):[/bold]")
+    console.print(f"  [dim]Enter = taostats validator ({TAOSTATS_VALIDATOR[:20]}...)[/dim]")
+    own_hotkeys = w.get("hotkeys", [])
+    if own_hotkeys:
+        shown = own_hotkeys[:8]
+        console.print(
+            f"  [dim]Your hotkeys: {', '.join(shown)}"
+            f"{'...' if len(own_hotkeys) > 8 else ''}[/dim]"
+        )
+    console.print("  [dim]Options: hotkey name from this wallet | SS58 address | Enter for default[/dim]")
+
+    hotkey_input = Prompt.ask("  Hotkey", default="").strip()
+
+    if not hotkey_input:
+        hotkey_ss58 = TAOSTATS_VALIDATOR
+        hotkey_label = f"taostats ({hotkey_ss58[:16]}...)"
+    elif hotkey_input in own_hotkeys:
+        from bittensor_wallet import Wallet as _BTWallet
+        try:
+            hw = _BTWallet(name=w["name"], hotkey=hotkey_input, path=base_path)
+            hotkey_ss58 = hw.hotkey.ss58_address
+            hotkey_label = f"own hotkey '{hotkey_input}' ({hotkey_ss58[:16]}...)"
+        except Exception as e:
+            print_error(f"Failed to load hotkey '{hotkey_input}': {e}")
+            return
+    elif hotkey_input.startswith("5") and len(hotkey_input) >= 46:
+        hotkey_ss58 = hotkey_input
+        hotkey_label = f"{hotkey_ss58[:16]}... (custom)"
+    else:
+        print_error(
+            f"'{hotkey_input}' is not a hotkey name in '{w['name']}' "
+            f"and doesn't look like an SS58 address"
+        )
+        return
+
+    console.print(f"  Validator: [cyan]{hotkey_label}[/cyan]")
+
+    # ── 5. Amount in TAO ─────────────────────────────────────────────────
+    console.print()
+    amount_str = Prompt.ask("  Amount to stake (TAO)")
+    try:
+        amount_tao = float(amount_str)
+    except ValueError:
+        print_error("Invalid amount")
+        return
+
+    if amount_tao <= 0:
+        print_error("Amount must be > 0")
+        return
+    if amount_tao > bal["free_tao"]:
+        print_error(
+            f"Insufficient balance — you have {bal['free_tao']:.6f} TAO, "
+            f"requested {amount_tao:.6f} TAO"
+        )
+        return
+
+    # Show alpha estimate
+    if alpha_per_tao:
+        est_alpha = amount_tao * alpha_per_tao
+        line = f"  Estimated receive: ~[yellow]{est_alpha:.4f} {alpha_symbol}[/yellow]"
+        if tao_price:
+            line += f" [dim](${amount_tao * tao_price:.2f} USD)[/dim]"
+        console.print(line)
+
+    # ── 6. Slippage / MEV protection ─────────────────────────────────────
+    # limit_price for add_stake_limit = max acceptable TAO-per-alpha price (in RAO internally).
+    # chain param is RAO per alpha = tao_to_rao(moving_price * (1 + slippage/100)).
+    # Staking TAO → alpha: limit_price acts as a cap on how expensive alpha can get.
+    limit_price = None
+    allow_partial = True
+
+    if moving_price > 0:
+        recommended_limit = moving_price * (1 + DEFAULT_SLIPPAGE_PCT / 100)
+        console.print(f"\n  [bold]MEV protection (add_stake_limit):[/bold]")
+        console.print(
+            f"  Current: {moving_price:.6f} TAO/{alpha_symbol} "
+            f"(= {alpha_per_tao:.4f} {alpha_symbol}/TAO)"
+        )
+        console.print(
+            f"  Default limit ({DEFAULT_SLIPPAGE_PCT}% max slippage): "
+            f"[cyan]{recommended_limit:.6f}[/cyan] TAO/{alpha_symbol} "
+            f"(min {1/recommended_limit:.4f} {alpha_symbol}/TAO)"
+        )
+        console.print(
+            "  [dim]Enter = default | e.g. '3' = 3% slippage | 'no' = market order[/dim]"
+        )
+
+        slip_raw = Prompt.ask(
+            "  Slippage %",
+            default=str(DEFAULT_SLIPPAGE_PCT),
+        ).strip().lower()
+
+        if slip_raw in ("no", "none", "off", "0"):
+            limit_price = None
+            allow_partial = True
+            print_warn("No slippage protection — market order")
+        else:
+            try:
+                val = float(slip_raw)
+                if val < 0:
+                    print_error("Slippage must be >= 0")
+                    return
+                if val >= 100:
+                    print_error("Slippage % must be < 100")
+                    return
+                # limit_price = max TAO per alpha (chain unit: tao_to_rao applied in staking.py)
+                limit_price = moving_price * (1 + val / 100)
+                min_alpha = 1.0 / limit_price if limit_price > 0 else 0
+                console.print(
+                    f"  Limit: [cyan]{limit_price:.6f}[/cyan] TAO/{alpha_symbol} "
+                    f"— min {min_alpha:.4f} {alpha_symbol}/TAO ({val}% tolerance)"
+                )
+            except ValueError:
+                print_error("Invalid slippage input")
+                return
+
+            allow_partial = Confirm.ask("  Allow partial fill?", default=True)
+
+    # ── 7. Summary + confirm ──────────────────────────────────────────────
+    console.print("\n  [bold cyan]━━━━━ Stake Summary ━━━━━[/bold cyan]")
+    console.print(f"  Coldkey : [cyan]{w['name']}[/cyan]")
+    console.print(f"  Validator: [cyan]{hotkey_ss58}[/cyan]")
+    console.print(f"  Subnet  : [yellow]SN{netuid} ({subnet_name})[/yellow]")
+    console.print(f"  Amount  : [bold yellow]{amount_tao:.6f} TAO[/bold yellow]")
+    if alpha_per_tao:
+        est_alpha = amount_tao * alpha_per_tao
+        line = f"  Expected: ~[yellow]{est_alpha:.4f} {alpha_symbol}[/yellow]"
+        if tao_price:
+            line += f" [dim](${amount_tao * tao_price:.2f} USD)[/dim]"
+        console.print(line)
+    if limit_price is not None:
+        min_alpha = 1.0 / limit_price if limit_price > 0 else 0
+        console.print(
+            f"  MEV     : [green]Protected[/green] — max {limit_price:.6f} TAO/{alpha_symbol} "
+            f"(min {min_alpha:.4f} {alpha_symbol}/TAO), "
+            f"partial={'yes' if allow_partial else 'no'}"
+        )
+    else:
+        console.print("  MEV     : [red]None (market order)[/red]")
+
+    if not Confirm.ask("\n  Confirm stake?"):
+        return
+
+    console.print("  [dim]Unlocking coldkey...[/dim]")
+    _ = wallet.coldkey
+
+    console.print("  [dim]Submitting...[/dim]")
+    success, error = await add_stake(
+        client, wallet, hotkey_ss58, netuid, amount_tao,
+        limit_price=limit_price,
+        allow_partial=allow_partial,
+    )
+
+    if success:
+        print_success(f"Staked {amount_tao:.6f} TAO on SN{netuid}!")
+        if alpha_per_tao:
+            console.print(
+                f"  Expected ~{amount_tao * alpha_per_tao:.4f} {alpha_symbol} — "
+                f"check Wallet Stats to verify"
+            )
+    else:
+        print_error(f"Staking failed: {error}")
+
+
+# ========================================================================
 # 6. Unstake
 # ========================================================================
 
@@ -2439,6 +2674,7 @@ HANDLERS = {
     "6": handle_unstake,
     "7": handle_subnet_info,
     "8": handle_wallet_groups,
+    "9": handle_add_stake,
 }
 
 
@@ -2455,7 +2691,7 @@ async def main_menu_loop(client: SubstrateClient, config: dict):
                 if choice in ("1", "8"):
                     await handler(config)
                 else:
-                    await handler(client, config)
+                    await handler(client, config)  # all others take (client, config)
             except KeyboardInterrupt:
                 console.print("\n  [dim]Cancelled[/dim]")
             except Exception as e:
