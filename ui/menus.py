@@ -1574,7 +1574,7 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
     print_header("Add Stake")
     base_path = config["wallet"]["base_path"]
 
-    DEFAULT_SLIPPAGE_PCT = 1.0  # 1% — tight slippage for MEV protection
+    DEFAULT_SLIPPAGE_PCT = 3.0  # 3% — covers spot/moving divergence + market impact
 
     # ── 1. Coldkey selection ──────────────────────────────────────────────
     w = select_single_wallet(base_path, "Select coldkey (staker)")
@@ -1606,10 +1606,15 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
         tao_price = None
 
     moving_price = 0.0
+    spot_price = 0.0        # actual AMM pool price = tao_in / alpha_in (in RAO ratio = display ratio)
     alpha_symbol = "alpha"
     subnet_name = f"SN{netuid}"
     if dynamic_info:
         moving_price = decode_price(dynamic_info.get("moving_price", 0))
+        tao_in_rao = dynamic_info.get("tao_in", 0) or 0
+        alpha_in_rao = dynamic_info.get("alpha_in", 0) or 0
+        if alpha_in_rao > 0:
+            spot_price = tao_in_rao / alpha_in_rao  # same ratio in RAO and display units
         raw_sym = dynamic_info.get("token_symbol", b"")
         if raw_sym:
             alpha_symbol = decode_bytes(raw_sym) or "alpha"
@@ -1617,19 +1622,27 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
         if raw_name:
             subnet_name = decode_bytes(raw_name) or f"SN{netuid}"
 
-    alpha_per_tao = (1.0 / moving_price) if moving_price > 0 else None
+    # Use spot_price as base (more accurate than moving_price TWAP for actual execution)
+    base_price = spot_price if spot_price > 0 else moving_price
 
-    if alpha_per_tao:
+    if base_price > 0:
+        console.print(f"  [bold]SN{netuid} — {subnet_name} ({alpha_symbol})[/bold]")
+        spot_apt = 1.0 / spot_price if spot_price > 0 else 0
+        move_apt = 1.0 / moving_price if moving_price > 0 else 0
         console.print(
-            f"  [bold]SN{netuid} — {subnet_name} ({alpha_symbol})[/bold]"
+            f"  Spot price : [yellow]1 TAO = {spot_apt:.4f} {alpha_symbol}[/yellow]"
+            f"  (1 {alpha_symbol} = {spot_price:.6f} TAO)"
         )
-        console.print(
-            f"  Price: [yellow]1 TAO = {alpha_per_tao:.4f} {alpha_symbol}[/yellow]"
-            f"  |  1 {alpha_symbol} = {moving_price:.6f} TAO"
-        )
+        if moving_price > 0 and abs(spot_price - moving_price) / moving_price > 0.001:
+            console.print(
+                f"  Moving avg : [dim]1 TAO = {move_apt:.4f} {alpha_symbol}[/dim]"
+                f"  [dim](1 {alpha_symbol} = {moving_price:.6f} TAO)[/dim]"
+            )
         if tao_price:
-            usd_per_alpha = moving_price * tao_price
-            console.print(f"  ({alpha_symbol}: ~${usd_per_alpha:.4f} USD | TAO: ~${tao_price:.2f} USD)")
+            usd_per_alpha = base_price * tao_price
+            console.print(
+                f"  ({alpha_symbol}: ~${usd_per_alpha:.4f} USD | TAO: ~${tao_price:.2f} USD)"
+            )
     else:
         print_warn("Could not fetch current price — proceeding without estimates")
 
@@ -1643,7 +1656,7 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
             f"  [dim]Your hotkeys: {', '.join(shown)}"
             f"{'...' if len(own_hotkeys) > 8 else ''}[/dim]"
         )
-    console.print("  [dim]Options: hotkey name from this wallet | SS58 address | Enter for default[/dim]")
+    console.print("  [dim]Options: hotkey name | SS58 address | Enter for default[/dim]")
 
     hotkey_input = Prompt.ask("  Hotkey", default="").strip()
 
@@ -1690,35 +1703,35 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
         )
         return
 
-    # Show alpha estimate
-    if alpha_per_tao:
-        est_alpha = amount_tao * alpha_per_tao
+    # Show alpha estimate (from spot price — more accurate)
+    if base_price > 0:
+        est_alpha = amount_tao / base_price
         line = f"  Estimated receive: ~[yellow]{est_alpha:.4f} {alpha_symbol}[/yellow]"
         if tao_price:
             line += f" [dim](${amount_tao * tao_price:.2f} USD)[/dim]"
         console.print(line)
 
     # ── 6. Slippage / MEV protection ─────────────────────────────────────
-    # limit_price for add_stake_limit = max acceptable TAO-per-alpha price (in RAO internally).
-    # chain param is RAO per alpha = tao_to_rao(moving_price * (1 + slippage/100)).
-    # Staking TAO → alpha: limit_price acts as a cap on how expensive alpha can get.
+    # limit_price for add_stake_limit = max acceptable TAO/alpha (RAO per alpha on chain).
+    # Base = spot_price (tao_in/alpha_in), not moving_price TWAP.
+    # add_stake fails with PriceLimitExceeded if actual price > limit.
     limit_price = None
     allow_partial = True
 
-    if moving_price > 0:
-        recommended_limit = moving_price * (1 + DEFAULT_SLIPPAGE_PCT / 100)
+    if base_price > 0:
+        recommended_limit = base_price * (1 + DEFAULT_SLIPPAGE_PCT / 100)
         console.print(f"\n  [bold]MEV protection (add_stake_limit):[/bold]")
         console.print(
-            f"  Current: {moving_price:.6f} TAO/{alpha_symbol} "
-            f"(= {alpha_per_tao:.4f} {alpha_symbol}/TAO)"
+            f"  Spot: {base_price:.6f} TAO/{alpha_symbol} "
+            f"(= {1/base_price:.4f} {alpha_symbol}/TAO)"
         )
         console.print(
-            f"  Default limit ({DEFAULT_SLIPPAGE_PCT}% max slippage): "
+            f"  Default limit ({DEFAULT_SLIPPAGE_PCT}% slippage): "
             f"[cyan]{recommended_limit:.6f}[/cyan] TAO/{alpha_symbol} "
             f"(min {1/recommended_limit:.4f} {alpha_symbol}/TAO)"
         )
         console.print(
-            "  [dim]Enter = default | e.g. '3' = 3% slippage | 'no' = market order[/dim]"
+            "  [dim]Enter = default | '5' = 5% | 'no' = market order (no limit)[/dim]"
         )
 
         slip_raw = Prompt.ask(
@@ -1739,9 +1752,8 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
                 if val >= 100:
                     print_error("Slippage % must be < 100")
                     return
-                # limit_price = max TAO per alpha (chain unit: tao_to_rao applied in staking.py)
-                limit_price = moving_price * (1 + val / 100)
-                min_alpha = 1.0 / limit_price if limit_price > 0 else 0
+                limit_price = base_price * (1 + val / 100)
+                min_alpha = 1.0 / limit_price
                 console.print(
                     f"  Limit: [cyan]{limit_price:.6f}[/cyan] TAO/{alpha_symbol} "
                     f"— min {min_alpha:.4f} {alpha_symbol}/TAO ({val}% tolerance)"
@@ -1758,14 +1770,14 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
     console.print(f"  Validator: [cyan]{hotkey_ss58}[/cyan]")
     console.print(f"  Subnet  : [yellow]SN{netuid} ({subnet_name})[/yellow]")
     console.print(f"  Amount  : [bold yellow]{amount_tao:.6f} TAO[/bold yellow]")
-    if alpha_per_tao:
-        est_alpha = amount_tao * alpha_per_tao
+    if base_price > 0:
+        est_alpha = amount_tao / base_price
         line = f"  Expected: ~[yellow]{est_alpha:.4f} {alpha_symbol}[/yellow]"
         if tao_price:
             line += f" [dim](${amount_tao * tao_price:.2f} USD)[/dim]"
         console.print(line)
     if limit_price is not None:
-        min_alpha = 1.0 / limit_price if limit_price > 0 else 0
+        min_alpha = 1.0 / limit_price
         console.print(
             f"  MEV     : [green]Protected[/green] — max {limit_price:.6f} TAO/{alpha_symbol} "
             f"(min {min_alpha:.4f} {alpha_symbol}/TAO), "
@@ -1789,9 +1801,9 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
 
     if success:
         print_success(f"Staked {amount_tao:.6f} TAO on SN{netuid}!")
-        if alpha_per_tao:
+        if base_price > 0:
             console.print(
-                f"  Expected ~{amount_tao * alpha_per_tao:.4f} {alpha_symbol} — "
+                f"  Expected ~{amount_tao / base_price:.4f} {alpha_symbol} — "
                 f"check Wallet Stats to verify"
             )
     else:
