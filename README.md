@@ -23,6 +23,7 @@ python main.py
 - Free, Staked, and Total TAO per wallet
 - USD values via Binance/CoinGecko pricing
 - Per-subnet breakdown with emissions
+- Registration summary with current burn cost per subnet and total registration value
 
 **Registration**
 - Burn-based registration to any subnet

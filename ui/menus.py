@@ -372,8 +372,22 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
     t2 = time.time()
     console.print(f"  [dim]Stats loaded in {t2-t1:.1f}s (total {t2-t0:.1f}s)[/dim]")
 
+    burn_costs = None
+    if len(all_stats) > 1:
+        reg_netuids = sorted({
+            s["netuid"] for _, st in all_stats
+            for s in st.get("subnets", []) if s.get("is_registered")
+        })
+        if reg_netuids:
+            console.print(f"  [dim]Fetching burn costs for {len(reg_netuids)} subnets...[/dim]")
+            try:
+                from core.stats import fetch_all_burn_costs
+                burn_costs = await fetch_all_burn_costs(client, reg_netuids)
+            except Exception as e:
+                print_warn(f"Burn costs unavailable: {e}")
+
     if all_stats:
-        display_multi_wallet_stats(all_stats)
+        display_multi_wallet_stats(all_stats, burn_costs=burn_costs)
 
 
 async def _check_subnet_registrations(client: SubstrateClient, config: dict):

@@ -143,8 +143,14 @@ def display_wallet_stats(stats: dict, wallet_name: str = ""):
         console.print("  [dim]No registrations found[/dim]")
 
 
-def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
-    """Display combined stats for multiple wallets with grand totals."""
+def display_multi_wallet_stats(all_stats: list[tuple[str, dict]], burn_costs: dict = None):
+    """
+    Display combined stats for multiple wallets with grand totals.
+
+    burn_costs: optional {netuid: burn_cost_tao} — when given, each subnet line
+    shows the current burn registration price and what re-registering all
+    hotkeys there would cost now, plus a grand total of registration value.
+    """
     grand_free = 0.0
     grand_staked = 0.0
     grand_total = 0.0
@@ -188,8 +194,32 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]]):
         if subnet_reg_count:
             total_reg = sum(subnet_reg_count.values())
             console.print(f"  [bold]Registrations ({total_reg} total):[/bold]")
+            burn_costs = burn_costs or {}
+            total_reg_value = 0.0
+            missing_burn = 0
             for (netuid, name), count in sorted(subnet_reg_count.items()):
-                console.print(f"    SN{netuid} {name}: [cyan]{count}[/cyan] hotkeys")
+                line = f"    SN{netuid} {name}: [cyan]{count}[/cyan] hotkeys"
+                burn = burn_costs.get(netuid)
+                if burn is not None:
+                    value = burn * count
+                    total_reg_value += value
+                    line += f"  [dim]@[/dim] [yellow]{burn:.4f} τ[/yellow]  [dim]=[/dim] [green]{value:.4f} τ[/green]"
+                    if tao_price:
+                        line += f" [dim](${value * tao_price:,.2f})[/dim]"
+                elif burn_costs:
+                    missing_burn += count
+                    line += "  [dim]@ n/a[/dim]"
+                console.print(line)
+            if burn_costs:
+                console.print(
+                    f"  [bold]Registration value (at current burn):[/bold] "
+                    f"[bold green]{total_reg_value:.4f} τ[/bold green]", end=""
+                )
+                if tao_price:
+                    console.print(f" [bold green](${total_reg_value * tao_price:,.2f})[/bold green]", end="")
+                if missing_burn:
+                    console.print(f" [dim]({missing_burn} hotkeys without burn price)[/dim]", end="")
+                console.print()
 
 
 def display_subnet_overview(info: dict, tao_price: float = None):

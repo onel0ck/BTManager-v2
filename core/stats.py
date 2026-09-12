@@ -113,6 +113,49 @@ async def build_global_neuron_cache(client: SubstrateClient) -> dict:
     return hotkey_map
 
 
+async def fetch_all_burn_costs(client: SubstrateClient, netuids: list = None) -> dict:
+    """
+    Fetch current burn registration cost for subnets.
+    Tries a single query_map over SubtensorModule.Burn first, falls back to
+    per-subnet queries. Returns {netuid: burn_cost_tao}.
+    """
+    costs = {}
+    try:
+        result = await client.substrate.query_map(
+            module="SubtensorModule",
+            storage_function="Burn",
+            max_results=1000,
+        )
+        async for key, value in result:
+            try:
+                nid = int(key.value if hasattr(key, "value") else key)
+                val = value.value if hasattr(value, "value") else value
+                costs[nid] = rao_to_tao(int(val or 0))
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"query_map Burn failed, falling back to per-subnet: {e}")
+
+    if netuids:
+        missing = [n for n in netuids if n not in costs]
+    else:
+        missing = [] if costs else await client.get_all_subnet_netuids()
+
+    if missing:
+        async def one(nid):
+            try:
+                return nid, rao_to_tao(await client.get_burn_cost(nid))
+            except Exception:
+                return nid, None
+        BATCH = 25
+        for i in range(0, len(missing), BATCH):
+            for nid, cost in await asyncio.gather(*[one(n) for n in missing[i:i+BATCH]]):
+                if cost is not None:
+                    costs[nid] = cost
+
+    return costs
+
+
 async def get_wallet_stats(
     client: SubstrateClient,
     coldkey_ss58: str,
