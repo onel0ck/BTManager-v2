@@ -24,7 +24,7 @@ from ui.display import (
 )
 from utils.wallet_groups import load_groups, create_group, delete_group, get_group, list_group_names
 from utils.collect_addresses import (
-    load_collect_addresses, set_collect_address, delete_collect_address,
+    load_collect_addresses, save_collect_addresses, set_collect_address, delete_collect_address,
     parse_binding_line, is_valid_ss58,
 )
 
@@ -2709,42 +2709,91 @@ def _manage_collect_addresses(base_path: str):
     choice = Prompt.ask("Select", choices=["1", "2", "3"], default="2")
 
     if choice == "1":
+        import re
         wallet_names = {w["name"] for w in list_wallets(base_path)}
         bound = load_collect_addresses()
-        console.print("  Enter one binding per line: [cyan]<wallet> <SS58 address>[/cyan]")
-        console.print("  [dim]e.g. clean_1 5DoBEK...  (':' '=' ',' also work, multi-line paste is fine). Empty line to finish.[/dim]")
-        saved = 0
+        console.print("  Paste or type bindings, one per line: [cyan]<wallet> <SS58 address>[/cyan]")
+        console.print("  [dim]e.g. clean_1 5DoBEK...  (':' '=' ',' also work)[/dim]")
+        console.print("  [bold]When done, press Enter on an empty line.[/bold]\n")
+
+        # Read everything silently first, so pasted blocks stay readable
+        lines = []
         while True:
             try:
-                line = console.input("  > ").strip()
+                line = console.input("").strip()
             except EOFError:
                 break
             if not line:
                 break
+            lines.append(line)
+        if not lines:
+            print_info("Nothing entered")
+            return
+
+        added, updated, unchanged, errors = [], [], [], []
+        for line in lines:
             pair = parse_binding_line(line)
             if not pair:
-                print_error(f"Can't parse: '{line}' (expected: <wallet> <address>)")
+                errors.append((line, "expected: <wallet> <address>"))
                 continue
             name, address = pair
             # allow reversed order: <address> <wallet>
             if name not in wallet_names and address in wallet_names:
                 name, address = address, name
             if name not in wallet_names:
-                print_error(f"Wallet '{name}' not found")
+                errors.append((line, f"wallet '{name}' not found"))
+                continue
+            if not is_valid_ss58(address):
+                errors.append((line, "invalid SS58 address (checksum failed)"))
                 continue
             old = bound.get(name)
-            try:
-                set_collect_address(name, address)
-            except ValueError as e:
-                print_error(str(e))
-                continue
-            bound[name] = address
-            saved += 1
-            if old and old != address:
-                print_success(f"{name} → {address} [yellow](was {old})[/yellow]")
+            if old == address:
+                unchanged.append(name)
+            elif old:
+                updated.append((name, old, address))
             else:
-                print_success(f"{name} → {address}")
-        print_info(f"Saved {saved} binding(s), {len(bound)} total")
+                added.append(name)
+            bound[name] = address
+
+        if added or updated:
+            save_collect_addresses(bound)
+
+        console.print()
+        table = Table(title="Bindings result", show_lines=False)
+        table.add_column("Wallet", style="cyan")
+        table.add_column("Collect destination", no_wrap=True)
+        table.add_column("Status")
+        upd = {n: o for n, o, _ in updated}
+        for name in added + [n for n, _, _ in updated] + unchanged:
+            if name in upd:
+                status = "[yellow]updated[/yellow]"
+            elif name in unchanged:
+                status = "[dim]unchanged[/dim]"
+            else:
+                status = "[green]added[/green]"
+            table.add_row(name, bound[name], status)
+        if table.row_count:
+            console.print(table)
+        for name, old_addr, _ in updated:
+            console.print(f"  [yellow]{name}[/yellow] previous address: [dim]{old_addr}[/dim]")
+        for line, reason in errors:
+            print_error(f"{reason}: '{line}'")
+        console.print(
+            f"  [green]{len(added)} added[/green], [yellow]{len(updated)} updated[/yellow], "
+            f"[dim]{len(unchanged)} unchanged[/dim], [red]{len(errors)} errors[/red] "
+            f"— {len(bound)} bindings total"
+        )
+
+        # Hint: wallets from the same numbered family that still have no binding
+        def family(n):
+            return re.sub(r"\d+$", "", n)
+        families = {family(n) for n in added + unchanged + [u[0] for u in updated] if family(n) != n}
+        missing = sorted(
+            (n for n in wallet_names if n not in bound and family(n) in families),
+            key=lambda n: (family(n), int(re.search(r"\d+$", n).group())),
+        )
+        if missing:
+            print_warn(f"Still without binding: {', '.join(missing)}")
 
     elif choice == "2":
         bound = load_collect_addresses()
