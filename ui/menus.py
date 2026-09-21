@@ -23,6 +23,10 @@ from ui.display import (
     display_subnet_overview, display_wallet_list,
 )
 from utils.wallet_groups import load_groups, create_group, delete_group, get_group, list_group_names
+from utils.collect_addresses import (
+    load_collect_addresses, set_collect_address, delete_collect_address,
+    parse_binding_line, is_valid_ss58,
+)
 
 MENU_OPTIONS = [
     ("1", "Create Wallet (Coldkey/Hotkey)"),
@@ -1025,53 +1029,110 @@ async def _transfer_batch(client, base_path):
 
 
 async def _transfer_collect(client, base_path):
-    dest = Prompt.ask("Destination SS58 address")
+    bound = load_collect_addresses()
+    console.print("  [cyan]1.[/cyan] One destination for all wallets")
+    console.print(
+        f"  [cyan]2.[/cyan] Bound addresses (each wallet → its own saved address)"
+        f" [dim]({len(bound)} saved)[/dim]"
+    )
+    dest_mode = Prompt.ask("Destination mode", choices=["1", "2"], default="2" if bound else "1")
+
+    common_dest = None
+    if dest_mode == "1":
+        common_dest = Prompt.ask("Destination SS58 address").strip()
+        if not is_valid_ss58(common_dest):
+            print_error(f"Invalid SS58 address: {common_dest}")
+            return
     leave_behind = FloatPrompt.ask("TAO to leave in each wallet (for fees)", default=0.01)
 
     selected = select_wallets(base_path, "Select source wallet(s)")
     if not selected:
         return
 
+    # Resolve destination per wallet
+    dest_map = {}
+    if dest_mode == "1":
+        conflicts = [w["name"] for w in selected if bound.get(w["name"]) and bound[w["name"]] != common_dest]
+        use_bound = False
+        if conflicts:
+            print_warn(
+                f"{len(conflicts)} selected wallet(s) have a different bound collect address: "
+                f"{', '.join(conflicts[:10])}{'...' if len(conflicts) > 10 else ''}"
+            )
+            use_bound = Confirm.ask("Send those to their bound addresses instead?", default=True)
+        for w in selected:
+            name = w["name"]
+            dest_map[name] = bound[name] if (use_bound and name in conflicts) else common_dest
+    else:
+        for w in selected:
+            name = w["name"]
+            if name in bound:
+                dest_map[name] = bound[name]
+                continue
+            entered = Prompt.ask(
+                f"  No bound address for [cyan]{name}[/cyan] — enter SS58 to save it (Enter to skip)",
+                default="",
+            ).strip()
+            if not entered:
+                print_warn(f"Skipping {name}")
+                continue
+            try:
+                set_collect_address(name, entered)
+                dest_map[name] = entered
+                print_success(f"Saved {name} → {entered}")
+            except ValueError as e:
+                print_error(f"{e} — skipping {name}")
+
     send_list = []
     for w in selected:
+        dest = dest_map.get(w["name"])
+        if not dest:
+            continue
         addr = get_coldkey_ss58(w["name"], base_path)
         if not addr:
+            continue
+        if addr == dest:
+            print_warn(f"{w['name']}: destination equals its own address, skipping")
             continue
         bal = await check_balance(client, addr)
         available = bal["free_tao"] - leave_behind
         if available > 0.0001:
-            send_list.append((w, addr, available))
-            console.print(f"  {w['name']:>12}: {bal['free_tao']:.4f} TAO → send {available:.4f}")
+            send_list.append((w, addr, available, dest))
+            console.print(f"  {w['name']:>12}: {bal['free_tao']:.4f} TAO → send {available:.4f} → [dim]{dest}[/dim]")
 
     if not send_list:
         print_warn("No wallets with sufficient balance")
         return
 
-    total = sum(a for _, _, a in send_list)
+    total = sum(a for _, _, a, _ in send_list)
+    unique_dests = sorted({d for _, _, _, d in send_list})
     console.print(f"\n  Total to collect: [yellow]{total:.4f} TAO[/yellow] from {len(send_list)} wallets")
-    console.print(f"  Destination: {dest}")
+    if len(unique_dests) == 1:
+        console.print(f"  Destination: {unique_dests[0]}")
+    else:
+        console.print(f"  Destinations: [yellow]{len(unique_dests)} different addresses[/yellow] (see list above)")
     if not Confirm.ask("Proceed with collect?"):
         return
 
     # Unlock all coldkeys first
     console.print("  [dim]Unlocking all coldkeys...[/dim]")
     wallet_plans = []
-    for w, addr, amount in send_list:
+    for w, addr, amount, dest in send_list:
         wallet = load_wallet(w["name"], base_path=base_path)
         _ = wallet.coldkey  # unlock
-        wallet_plans.append((w["name"], wallet, amount))
+        wallet_plans.append((w["name"], wallet, amount, dest))
 
     # Send all transfers in parallel (different coldkeys = no nonce conflict)
     console.print(f"  [dim]Sending {len(wallet_plans)} transfers in parallel...[/dim]")
 
-    async def collect_one(name, wallet, amount):
+    async def collect_one(name, wallet, amount, dest):
         try:
             success, error = await transfer_tao_keep_alive(client, wallet, dest, amount)
-            return (name, amount, success, error)
+            return (name, amount, dest, success, error)
         except Exception as e:
-            return (name, amount, False, str(e))
+            return (name, amount, dest, False, str(e))
 
-    tasks = [collect_one(name, w, amt) for name, w, amt in wallet_plans]
+    tasks = [collect_one(name, w, amt, d) for name, w, amt, d in wallet_plans]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Display results
@@ -1084,15 +1145,15 @@ async def _transfer_collect(client, base_path):
             print_error(f"Task failed: {r}")
             fail_count += 1
             continue
-        name, amount, success, error = r
+        name, amount, dest, success, error = r
         if success:
-            print_success(f"Collected {amount:.4f} TAO from {name}")
+            print_success(f"Collected {amount:.4f} TAO from {name} → {dest[:8]}...{dest[-6:]}")
             ok_count += 1
             collected_total += amount
         else:
             print_error(f"Failed {name}: {error}")
             fail_count += 1
-            failed_list.append((name, amount, error))
+            failed_list.append((name, amount, dest))
 
     console.print(
         f"\n  Done: [green]{ok_count} ok[/green] ({collected_total:.4f} TAO), "
@@ -1101,7 +1162,7 @@ async def _transfer_collect(client, base_path):
 
     # Retry failed ones sequentially if any
     if failed_list and Confirm.ask(f"Retry {len(failed_list)} failed transfers?"):
-        for name, amount, _ in failed_list:
+        for name, amount, dest in failed_list:
             console.print(f"  Retrying {name}...")
             wallet = load_wallet(name, base_path=base_path)
             _ = wallet.coldkey
@@ -2640,6 +2701,79 @@ async def _weights_analysis(client, config, netuid, num_epochs=1):
 # 8. Wallet Groups
 # ========================================================================
 
+def _manage_collect_addresses(base_path: str):
+    """Bind wallets to their personal collect destination (used by Transfer → Collect TAO)."""
+    console.print("\n  [cyan]1.[/cyan] Add / update bindings")
+    console.print("  [cyan]2.[/cyan] View bindings")
+    console.print("  [cyan]3.[/cyan] Delete binding")
+    choice = Prompt.ask("Select", choices=["1", "2", "3"], default="2")
+
+    if choice == "1":
+        wallet_names = {w["name"] for w in list_wallets(base_path)}
+        bound = load_collect_addresses()
+        console.print("  Enter one binding per line: [cyan]<wallet> <SS58 address>[/cyan]")
+        console.print("  [dim]e.g. clean_1 5DoBEK...  (':' '=' ',' also work, multi-line paste is fine). Empty line to finish.[/dim]")
+        saved = 0
+        while True:
+            try:
+                line = console.input("  > ").strip()
+            except EOFError:
+                break
+            if not line:
+                break
+            pair = parse_binding_line(line)
+            if not pair:
+                print_error(f"Can't parse: '{line}' (expected: <wallet> <address>)")
+                continue
+            name, address = pair
+            # allow reversed order: <address> <wallet>
+            if name not in wallet_names and address in wallet_names:
+                name, address = address, name
+            if name not in wallet_names:
+                print_error(f"Wallet '{name}' not found")
+                continue
+            old = bound.get(name)
+            try:
+                set_collect_address(name, address)
+            except ValueError as e:
+                print_error(str(e))
+                continue
+            bound[name] = address
+            saved += 1
+            if old and old != address:
+                print_success(f"{name} → {address} [yellow](was {old})[/yellow]")
+            else:
+                print_success(f"{name} → {address}")
+        print_info(f"Saved {saved} binding(s), {len(bound)} total")
+
+    elif choice == "2":
+        bound = load_collect_addresses()
+        if not bound:
+            print_info("No collect addresses bound yet")
+            return
+        table = Table(title="Collect Addresses", show_lines=False)
+        table.add_column("Wallet", style="cyan")
+        table.add_column("Collect destination", no_wrap=True)
+        for name, address in sorted(bound.items()):
+            table.add_row(name, address)
+        console.print(table)
+        console.print("  [dim]Used in Transfer TAO → Collect TAO → 'Bound addresses' mode[/dim]")
+
+    else:
+        bound = load_collect_addresses()
+        if not bound:
+            print_info("No bindings to delete")
+            return
+        for name, address in sorted(bound.items()):
+            console.print(f"    [cyan]{name}[/cyan] → {address}")
+        names = Prompt.ask("Wallet(s) to unbind (comma-separated)")
+        for name in [n.strip() for n in names.split(",") if n.strip()]:
+            if delete_collect_address(name):
+                print_success(f"Unbound {name}")
+            else:
+                print_error(f"No binding for '{name}'")
+
+
 async def handle_wallet_groups(config: dict):
     print_header("Wallet Groups")
     base_path = config["wallet"]["base_path"]
@@ -2647,7 +2781,12 @@ async def handle_wallet_groups(config: dict):
     console.print("  [cyan]1.[/cyan] Create / update group")
     console.print("  [cyan]2.[/cyan] View groups")
     console.print("  [cyan]3.[/cyan] Delete group")
-    choice = Prompt.ask("Select", choices=["1", "2", "3"])
+    console.print("  [cyan]4.[/cyan] Collect addresses (bind wallet → its own collect destination)")
+    choice = Prompt.ask("Select", choices=["1", "2", "3", "4"])
+
+    if choice == "4":
+        _manage_collect_addresses(base_path)
+        return
 
     if choice == "1":
         group_name = Prompt.ask("Group name (e.g. sn-11)")

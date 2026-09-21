@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 *.log
+collect_addresses.json
+wallet_groups.json

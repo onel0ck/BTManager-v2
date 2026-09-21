@@ -33,6 +33,7 @@ python main.py
 **Transfers**
 - Send TAO between wallets
 - Collect mode: gather TAO from many wallets into one
+- Bound collect addresses: bind each wallet to its own destination once (Wallet Groups → Collect addresses), then Collect TAO sends every wallet to its saved address
 - Batch mode: send from one wallet to many destinations
 
 **Staking**
