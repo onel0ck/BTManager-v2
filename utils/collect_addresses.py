@@ -81,12 +81,45 @@ def delete_collect_address(wallet_name: str) -> bool:
     return True
 
 
-def parse_binding_line(line: str) -> Optional[tuple[str, str]]:
+def parse_bindings(text: str) -> tuple[list[tuple[str, str]], list[str]]:
     """
-    Parse 'wallet address' pair. Accepts separators: space, ':', '=', ',', tab, '->'.
-    Returns (wallet_name, address) or None if the line is not a pair.
+    Parse many 'wallet:address' pairs from one string (or a whole file).
+
+    Pairs may be separated by ',', ';', spaces or newlines. Inside a pair the
+    separator may be ':', '=', '->' or just a space:
+        78-clean_1:5Do...,78-clean_2:5FZ...
+        78-clean_1 = 5Do...; 78-clean_2 5FZ...
+    Returns (pairs, leftovers) — leftovers are tokens that did not form a pair.
     """
-    parts = [p for p in re.split(r"\s*(?:->|[:=,\s])\s*", line.strip()) if p]
-    if len(parts) != 2:
-        return None
-    return parts[0], parts[1]
+    pairs: list[tuple[str, str]] = []
+    leftovers: list[str] = []
+    pending = None
+    for tok in re.split(r"[,;\s]+", text.strip()):
+        if not tok:
+            continue
+        parts = re.split(r"->|[:=]", tok, maxsplit=1)
+        if len(parts) == 2:
+            a, b = parts[0].strip(), parts[1].strip()
+            if a and b:
+                if pending:
+                    leftovers.append(pending)
+                    pending = None
+                pairs.append((a, b))
+            elif a:  # "wallet:" followed by the address as the next token
+                if pending:
+                    leftovers.append(pending)
+                pending = a
+            elif b and pending:  # ":address" after a bare wallet name
+                pairs.append((pending, b))
+                pending = None
+            elif b:
+                leftovers.append(b)
+            continue
+        if pending:
+            pairs.append((pending, tok))
+            pending = None
+        else:
+            pending = tok
+    if pending:
+        leftovers.append(pending)
+    return pairs, leftovers

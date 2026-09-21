@@ -25,7 +25,7 @@ from ui.display import (
 from utils.wallet_groups import load_groups, create_group, delete_group, get_group, list_group_names
 from utils.collect_addresses import (
     load_collect_addresses, save_collect_addresses, set_collect_address, delete_collect_address,
-    parse_binding_line, is_valid_ss58,
+    parse_bindings, is_valid_ss58,
 )
 
 MENU_OPTIONS = [
@@ -2712,32 +2712,42 @@ def _manage_collect_addresses(base_path: str):
         import re
         wallet_names = {w["name"] for w in list_wallets(base_path)}
         bound = load_collect_addresses()
-        console.print("  Paste or type bindings, one per line: [cyan]<wallet> <SS58 address>[/cyan]")
-        console.print("  [dim]e.g. clean_1 5DoBEK...  (':' '=' ',' also work)[/dim]")
-        console.print("  [bold]When done, press Enter on an empty line.[/bold]\n")
-
-        # Read everything silently first, so pasted blocks stay readable
-        lines = []
-        while True:
-            try:
-                line = console.input("").strip()
-            except EOFError:
-                break
-            if not line:
-                break
-            lines.append(line)
-        if not lines:
+        console.print("  Enter all bindings in ONE line, pairs separated by commas:")
+        console.print("  [cyan]wallet:address,wallet:address,...[/cyan]")
+        console.print("  [dim]e.g. 78-clean_1:5DoBEK...,78-clean_2:5FZRnr...[/dim]")
+        console.print("  [dim]Many wallets? Put pairs into a text file (any layout) and enter its path instead.[/dim]")
+        try:
+            raw = console.input("  > ").strip()
+        except EOFError:
+            raw = ""
+        if not raw:
             print_info("Nothing entered")
             return
 
+        # A path to a file with pairs (terminals cap one line at ~4096 chars)
+        from pathlib import Path
+        maybe_file = Path(raw).expanduser()
+        if ":" not in raw and "," not in raw and maybe_file.is_file():
+            try:
+                raw = maybe_file.read_text()
+                print_info(f"Read bindings from {maybe_file}")
+            except OSError as e:
+                print_error(f"Can't read {maybe_file}: {e}")
+                return
+
+        pairs, leftovers = parse_bindings(raw)
         added, updated, unchanged, errors = [], [], [], []
-        for line in lines:
-            pair = parse_binding_line(line)
-            if not pair:
-                errors.append((line, "expected: <wallet> <address>"))
-                continue
-            name, address = pair
-            # allow reversed order: <address> <wallet>
+        for tok in leftovers:
+            errors.append((tok, "not a wallet:address pair"))
+        if not pairs:
+            for tok, reason in errors:
+                print_error(f"{reason}: '{tok}'")
+            print_error("No bindings recognized. Format: wallet:address,wallet:address")
+            return
+
+        for name, address in pairs:
+            line = f"{name}:{address}"
+            # allow reversed order: address:wallet
             if name not in wallet_names and address in wallet_names:
                 name, address = address, name
             if name not in wallet_names:
