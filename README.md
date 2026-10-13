@@ -37,9 +37,9 @@ python main.py
 - Batch mode: send from one wallet to many destinations
 
 **Staking**
-- Unstake ALL: auto-finds hotkeys with stake, one confirm
-- Unstake from specific subnet
-- Unstake custom amounts
+- Unstake ALL: auto-finds hotkeys with stake across many wallets, one confirm
+- Unstake from subnet(s): any number of wallets x any number of subnets (`78,14`, `1-5`, `all`), optional alpha to keep per wallet per subnet
+- Unstake exact amount from one hotkey on one subnet
 
 **Subnet Info**
 - Browse all subnets with prices, emission, and registration cost

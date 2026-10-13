@@ -1919,344 +1919,480 @@ async def handle_unstake(client: SubstrateClient, config: dict):
     print_header("Unstake")
     base_path = config["wallet"]["base_path"]
 
-    console.print("  [cyan]1.[/cyan] Unstake ALL (find staked hotkeys, unstake each)")
-    console.print("  [cyan]2.[/cyan] Unstake from specific subnet (single wallet)")
-    console.print("  [cyan]3.[/cyan] Unstake specific amount from subnet")
-    console.print("  [cyan]4.[/cyan] Unstake from subnet (multi-wallet, keep amount)")
-    choice = Prompt.ask("Select", choices=["1", "2", "3", "4"])
+    console.print("  [cyan]1.[/cyan] Unstake ALL (every subnet, every hotkey)")
+    console.print("  [cyan]2.[/cyan] Unstake from subnet(s) (multi-wallet, e.g. 78,14 or 'all')")
+    console.print("  [cyan]3.[/cyan] Unstake exact amount (one hotkey, one subnet)")
+    choice = Prompt.ask("Select", choices=["1", "2", "3"])
 
     if choice == "1":
-        selected = select_wallets(base_path, "Select wallet(s) to unstake ALL")
-        if not selected:
-            return
-
-        # First pass: find all staked hotkeys across all selected wallets
-        unstake_plan = []  # list of (wallet_dict, addr, staked_hotkeys_set)
-        for w in selected:
-            addr = get_coldkey_ss58(w["name"], base_path)
-            if not addr:
-                print_warn(f"Could not load address for {w['name']}")
-                continue
-
-            console.print(f"  [dim]Checking {w['name']}...[/dim]")
-            try:
-                stake_entries = await client.get_stake_info_for_coldkey(addr)
-            except Exception as e:
-                print_error(f"Failed to query stakes for {w['name']}: {e}")
-                continue
-
-            if not stake_entries:
-                continue
-
-            from core.stats import decode_ss58
-            staked_hotkeys = set()
-            for entry in stake_entries:
-                if isinstance(entry, dict):
-                    stake = entry.get("stake", 0)
-                    if stake and stake > 0:
-                        hk = decode_ss58(entry.get("hotkey", ""))
-                        if hk:
-                            staked_hotkeys.add(hk)
-
-            if staked_hotkeys:
-                unstake_plan.append((w, addr, staked_hotkeys))
-                console.print(f"  {w['name']}: {len(staked_hotkeys)} hotkey(s) with stake")
-
-        if not unstake_plan:
-            print_info("No staked hotkeys found across selected wallets")
-            return
-
-        total_hotkeys = sum(len(hks) for _, _, hks in unstake_plan)
-        total_wallets = len(unstake_plan)
-        console.print(f"\n  Total: [yellow]{total_hotkeys} hotkeys[/yellow] across [yellow]{total_wallets} wallets[/yellow]")
-
-        # Mode selection
-        if total_wallets > 1:
-            console.print("\n  [cyan]A.[/cyan] Sequential (one tx at a time, safe)")
-            console.print("  [cyan]B.[/cyan] Parallel coldkeys (different wallets in same block, faster)")
-            mode = Prompt.ask("Mode", choices=["A", "B", "a", "b"], default="B").upper()
-        else:
-            mode = "A"
-
-        if not Confirm.ask("Unstake all?"):
-            return
-
-        if mode == "A":
-            # Sequential: one by one
-            for w, addr, staked_hotkeys in unstake_plan:
-                console.print(f"\n  [cyan]{w['name']}[/cyan] ({len(staked_hotkeys)} hotkeys)")
-                wallet = load_wallet(w["name"], base_path=base_path)
-                console.print("  [dim]Unlocking coldkey...[/dim]")
-                _ = wallet.coldkey
-
-                for hk_ss58 in staked_hotkeys:
-                    console.print(f"  Unstaking {hk_ss58[:16]}...")
-                    try:
-                        success, error = await unstake_all(client, wallet, hk_ss58)
-                        if success:
-                            print_success(f"Unstaked {hk_ss58[:16]}...")
-                        else:
-                            print_error(f"{hk_ss58[:16]}: {error}")
-                    except Exception as e:
-                        print_error(f"{hk_ss58[:16]}: {e}")
-        else:
-            # Parallel: different coldkeys run concurrently
-            # Hotkeys within same coldkey stay sequential (same nonce source)
-            console.print("\n  [dim]Unlocking all coldkeys...[/dim]")
-            wallet_plans = []
-            for w, addr, staked_hotkeys in unstake_plan:
-                wallet = load_wallet(w["name"], base_path=base_path)
-                _ = wallet.coldkey  # unlock
-                wallet_plans.append((w["name"], wallet, list(staked_hotkeys)))
-
-            console.print(f"  [dim]Starting parallel unstake ({total_wallets} wallets)...[/dim]")
-
-            async def unstake_wallet(name, wallet, hotkeys):
-                results = []
-                for hk_ss58 in hotkeys:
-                    try:
-                        success, error = await unstake_all(client, wallet, hk_ss58)
-                        results.append((name, hk_ss58, success, error))
-                    except Exception as e:
-                        results.append((name, hk_ss58, False, str(e)))
-                return results
-
-            tasks = [unstake_wallet(name, w, hks) for name, w, hks in wallet_plans]
-            all_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Display results
-            ok_count = 0
-            fail_count = 0
-            for result in all_results:
-                if isinstance(result, Exception):
-                    print_error(f"Wallet task failed: {result}")
-                    fail_count += 1
-                    continue
-                for name, hk_ss58, success, error in result:
-                    if success:
-                        print_success(f"{name}: unstaked {hk_ss58[:16]}...")
-                        ok_count += 1
-                    else:
-                        print_error(f"{name}: {hk_ss58[:16]} - {error}")
-                        fail_count += 1
-
-            console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
-
+        await _unstake_everything(client, base_path)
     elif choice == "2":
-        w = select_single_wallet(base_path)
-        if not w:
-            return
-        netuid = IntPrompt.ask("Subnet ID (netuid)")
+        await _unstake_from_subnets(client, base_path)
+    else:
+        await _unstake_exact_amount(client, base_path)
 
-        # Scan for actual staked hotkeys on this subnet (including external validators)
+
+def _parse_netuids(raw: str, available: list[int] = None) -> list[int]:
+    """
+    Parse subnet input: '78,14', '1-5', '78, 14 , 90', 'all'.
+    Returns sorted unique netuids ('all' needs `available`).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    if raw.lower() == "all":
+        return sorted(available or [])
+    out = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            try:
+                lo_i, hi_i = int(lo.strip()), int(hi.strip())
+            except ValueError:
+                console.print(f"  [yellow]Skipping '{part}': not a subnet range[/yellow]")
+                continue
+            if lo_i > hi_i:
+                lo_i, hi_i = hi_i, lo_i
+            out.update(range(lo_i, hi_i + 1))
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            console.print(f"  [yellow]Skipping '{part}': not a subnet id[/yellow]")
+    return sorted(out)
+
+
+async def _fetch_subnet_meta(client: SubstrateClient) -> dict:
+    """Return {netuid: (name, moving_price)} for display. Empty dict on failure."""
+    from core.substrate_client import decode_price, decode_bytes
+    try:
+        dynamic = await client.get_all_dynamic_info()
+    except Exception as e:
+        console.print(f"  [yellow]Could not fetch subnet names/prices: {e}[/yellow]")
+        return {}
+    meta = {}
+    for info in dynamic or []:
+        if not isinstance(info, dict):
+            continue
+        netuid = info.get("netuid", 0)
+        identity = info.get("subnet_identity")
+        if identity and isinstance(identity, dict):
+            raw = identity.get("subnet_name", info.get("subnet_name", ()))
+        else:
+            raw = info.get("subnet_name", ())
+        name = (decode_bytes(raw) if raw else "") or f"SN{netuid}"
+        meta[netuid] = (name, decode_price(info.get("moving_price", 0)))
+    return meta
+
+
+async def _scan_stake_positions(
+    client: SubstrateClient,
+    wallets: list[dict],
+    base_path: str,
+    netuids: list[int] = None,
+    concurrency: int = 20,
+) -> tuple[list, list]:
+    """
+    Scan selected wallets for stake positions in parallel.
+
+    netuids: restrict to these subnets (None = all subnets).
+    Returns (plan, failed) where
+        plan   = [(wallet_dict, coldkey_ss58, [(netuid, hotkey_ss58, alpha_tao), ...])]
+        failed = [(wallet_name, error)]
+    """
+    from core.stats import decode_ss58
+    from core.substrate_client import rao_to_tao
+
+    targets = []
+    for w in wallets:
         addr = get_coldkey_ss58(w["name"], base_path)
         if not addr:
-            print_error(f"Could not load address for {w['name']}")
-            return
+            print_warn(f"Could not load address for {w['name']}")
+            continue
+        targets.append((w, addr))
+    if not targets:
+        return [], []
 
-        console.print(f"  [dim]Scanning stakes on SN{netuid}...[/dim]")
-        try:
-            stakes = await client.get_stake_info_for_coldkey(addr)
-        except Exception as e:
-            print_error(f"Failed to get stakes: {e}")
-            return
+    wanted = set(netuids) if netuids else None
+    sem = asyncio.Semaphore(concurrency)
 
-        from core.stats import decode_ss58
-        from core.substrate_client import rao_to_tao
-
-        staked_hotkeys = []  # list of (hotkey_ss58, alpha_rao, alpha_tao)
-        for entry in stakes:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("netuid", 0) != netuid:
-                continue
-            alpha_rao = entry.get("stake", 0)
-            if alpha_rao <= 0:
-                continue
-            hk = decode_ss58(entry.get("hotkey", ""))
-            alpha_tao = rao_to_tao(alpha_rao)
-            staked_hotkeys.append((hk, alpha_rao, alpha_tao))
-            console.print(f"    HK {hk[:16]}... | {alpha_tao:.4f} alpha")
-
-        if not staked_hotkeys:
-            print_info(f"No stake found on SN{netuid} for {w['name']}")
-            return
-
-        total_alpha = sum(a for _, _, a in staked_hotkeys)
-        console.print(f"  Total: [yellow]{total_alpha:.4f} alpha[/yellow] across {len(staked_hotkeys)} hotkey(s)")
-
-        if not Confirm.ask(f"Unstake all from SN{netuid}?"):
-            return
-
-        console.print("  [dim]Unlocking coldkey...[/dim]")
-        wallet = load_wallet(w["name"], base_path=base_path)
-        _ = wallet.coldkey
-
-        for hk_ss58, alpha_rao, alpha_tao in staked_hotkeys:
-            console.print(f"  Unstaking {alpha_tao:.4f} from HK {hk_ss58[:16]}...")
-            success, error = await unstake_subnet(client, wallet, hk_ss58, netuid)
-            if success:
-                print_success(f"Unstaked from HK {hk_ss58[:16]}...")
-            else:
-                if error and "NotEnoughStake" in str(error):
-                    print_info(f"HK {hk_ss58[:16]}: no stake")
-                elif error and "AmountTooLow" in str(error):
-                    print_info(f"HK {hk_ss58[:16]}: amount too low, skipping")
-                else:
-                    print_error(f"HK {hk_ss58[:16]}: {error}")
-
-    elif choice == "3":
-        w = select_single_wallet(base_path)
-        if not w:
-            return
-        hk_names = select_hotkey(w)
-        if not hk_names or len(hk_names) > 1:
-            print_error("Select exactly one hotkey for partial unstake")
-            return
-        hk_name = hk_names[0]
-        wallet = load_wallet(w["name"], hk_name, base_path)
-        hotkey_ss58 = wallet.hotkey.ss58_address
-        netuid = IntPrompt.ask("Subnet ID (netuid)")
-        amount = FloatPrompt.ask("Amount of ALPHA to unstake")
-        if amount <= 0:
-            print_error("Amount must be > 0")
-            return
-        if not Confirm.ask(f"Unstake {amount} alpha from SN{netuid}?"):
-            return
-        console.print("  [dim]Unlocking coldkey...[/dim]")
-        _ = wallet.coldkey
-        success, error = await remove_stake(client, wallet, hotkey_ss58, netuid, amount)
-        if success:
-            print_success(f"Unstaked {amount} alpha from SN{netuid}")
-        else:
-            print_error(f"Unstake failed: {error}")
-
-    elif choice == "4":
-        # Multi-wallet unstake from subnet with keep amount
-        netuid = IntPrompt.ask("Subnet ID (netuid)")
-        keep_amount = FloatPrompt.ask("Alpha to keep per wallet on this subnet", default=0.0)
-
-        selected = select_wallets(base_path, "Select wallet(s) to unstake")
-        if not selected:
-            return
-
-        # Scan all wallets for stake on this subnet
-        console.print(f"  [dim]Scanning stakes on SN{netuid}...[/dim]")
-        from core.stats import decode_ss58
-        from core.substrate_client import rao_to_tao, tao_to_rao
-
-        unstake_plan = []  # list of (wallet_dict, coldkey_ss58, [(hotkey_ss58, unstake_rao, unstake_tao)])
-        for w in selected:
-            addr = get_coldkey_ss58(w["name"], base_path)
-            if not addr:
-                continue
-
+    async def scan(w, addr):
+        async with sem:
             try:
                 stakes = await client.get_stake_info_for_coldkey(addr)
             except Exception as e:
-                print_error(f"Failed to get stakes for {w['name']}: {e}")
+                return (w, addr, None, str(e))
+        positions = []
+        for entry in stakes or []:
+            if not isinstance(entry, dict):
                 continue
-
-            # Collect all positions on this subnet for this wallet
-            positions = []
-            for entry in stakes:
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("netuid", 0) != netuid:
-                    continue
-                alpha_rao = entry.get("stake", 0)
-                if alpha_rao <= 0:
-                    continue
-                hk = decode_ss58(entry.get("hotkey", ""))
-                positions.append((hk, alpha_rao, rao_to_tao(alpha_rao)))
-
-            if not positions:
+            netuid = entry.get("netuid", 0)
+            if wanted is not None and netuid not in wanted:
                 continue
-
-            # Calculate how much to unstake: total - keep, distributed proportionally
-            total_alpha_tao = sum(a for _, _, a in positions)
-            to_unstake_tao = total_alpha_tao - keep_amount
-
-            if to_unstake_tao <= 0.0001:
-                console.print(f"  {w['name']:>12}: {total_alpha_tao:.4f} alpha (keeping all)")
+            alpha_rao = entry.get("stake", 0) or 0
+            if alpha_rao <= 0:
                 continue
+            hk = decode_ss58(entry.get("hotkey", ""))
+            if not hk:
+                continue
+            positions.append((netuid, hk, rao_to_tao(alpha_rao)))
+        return (w, addr, positions, None)
 
-            # Distribute unstake proportionally across hotkeys
-            hotkey_unstakes = []
-            for hk, alpha_rao, alpha_tao in positions:
-                if total_alpha_tao > 0:
-                    proportion = alpha_tao / total_alpha_tao
-                else:
-                    proportion = 1.0 / len(positions)
-                hk_unstake_tao = to_unstake_tao * proportion
-                hk_unstake_rao = tao_to_rao(hk_unstake_tao)
-                if hk_unstake_rao > 0:
-                    hotkey_unstakes.append((hk, hk_unstake_rao, hk_unstake_tao))
+    results = await asyncio.gather(*[scan(w, a) for w, a in targets], return_exceptions=True)
 
-            if hotkey_unstakes:
-                unstake_plan.append((w, addr, hotkey_unstakes))
-                console.print(
-                    f"  {w['name']:>12}: {total_alpha_tao:.4f} alpha → unstake {to_unstake_tao:.4f} (keep {keep_amount:.4f})"
-                )
+    plan, failed = [], []
+    for r in results:
+        if isinstance(r, Exception):
+            failed.append(("?", str(r)))
+            continue
+        w, addr, positions, err = r
+        if err:
+            failed.append((w["name"], err))
+        elif positions:
+            plan.append((w, addr, positions))
+    return plan, failed
 
-        if not unstake_plan:
-            print_info(f"No wallets with stake to unstake on SN{netuid}")
-            return
 
-        total_unstake = sum(
-            sum(a for _, _, a in hks) for _, _, hks in unstake_plan
+async def _unstake_everything(client: SubstrateClient, base_path: str):
+    """Mode 1: unstake_all per hotkey — every subnet, every hotkey, many wallets."""
+    selected = select_wallets(base_path, "Select wallet(s) to unstake ALL")
+    if not selected:
+        return
+
+    console.print(f"  [dim]Scanning stakes for {len(selected)} wallets...[/dim]")
+    import time
+    t0 = time.time()
+    plan, failed = await _scan_stake_positions(client, selected, base_path)
+    for name, err in failed:
+        print_error(f"Failed to query stakes for {name}: {err}")
+    if not plan:
+        print_info("No staked hotkeys found across selected wallets")
+        return
+
+    meta = await _fetch_subnet_meta(client)
+    console.print(f"  [dim]Scanned in {time.time()-t0:.1f}s[/dim]")
+
+    # Group: one unstake_all tx per hotkey (covers all its subnets)
+    wallet_hotkeys = []  # (wallet_dict, [hotkey_ss58], alpha_total, tao_est)
+    for w, addr, positions in plan:
+        hotkeys = sorted({hk for _, hk, _ in positions})
+        alpha_total = sum(a for _, _, a in positions)
+        tao_est = sum(
+            a if netuid == 0 else a * meta.get(netuid, ("", 0.0))[1]
+            for netuid, _, a in positions
         )
-        console.print(
-            f"\n  Total to unstake: [yellow]{total_unstake:.4f} alpha[/yellow] "
-            f"from {len(unstake_plan)} wallets"
-        )
-        if not Confirm.ask("Proceed?"):
-            return
+        wallet_hotkeys.append((w, hotkeys, alpha_total, tao_est))
+        if len(plan) <= 20:
+            console.print(
+                f"  {w['name']:>14}: {len(hotkeys)} hotkey(s), "
+                f"{alpha_total:.4f} alpha (~{tao_est:.4f} τ)"
+            )
 
-        # Unlock all coldkeys
-        console.print("  [dim]Unlocking all coldkeys...[/dim]")
-        wallet_plans = []
-        for w, addr, hotkey_unstakes in unstake_plan:
-            wallet = load_wallet(w["name"], base_path=base_path)
-            _ = wallet.coldkey
-            wallet_plans.append((w["name"], wallet, hotkey_unstakes))
+    total_hotkeys = sum(len(hks) for _, hks, _, _ in wallet_hotkeys)
+    total_tao = sum(t for _, _, _, t in wallet_hotkeys)
+    console.print(
+        f"\n  Total: [yellow]{total_hotkeys} hotkeys[/yellow] across "
+        f"[yellow]{len(wallet_hotkeys)} wallets[/yellow], "
+        f"~[green]{total_tao:.4f} TAO[/green] estimated"
+    )
 
-        # Process in parallel
-        async def unstake_wallet(name, wallet, hotkey_unstakes):
-            results = []
-            for hk_ss58, unstake_rao, unstake_tao in hotkey_unstakes:
-                try:
-                    success, error = await remove_stake(
-                        client, wallet, hk_ss58, netuid, unstake_tao
-                    )
-                    results.append((name, hk_ss58, unstake_tao, success, error))
-                except Exception as e:
-                    results.append((name, hk_ss58, unstake_tao, False, str(e)))
-            return results
+    if len(wallet_hotkeys) > 1:
+        console.print("\n  [cyan]A.[/cyan] Sequential (one tx at a time, safe)")
+        console.print("  [cyan]B.[/cyan] Parallel coldkeys (different wallets in same block, faster)")
+        mode = Prompt.ask("Mode", choices=["A", "B", "a", "b"], default="B").upper()
+    else:
+        mode = "A"
 
-        console.print(f"  [dim]Unstaking from {len(wallet_plans)} wallets in parallel...[/dim]")
+    if not Confirm.ask("Unstake all?"):
+        return
+
+    console.print("  [dim]Unlocking coldkeys...[/dim]")
+    wallet_plans = []
+    for w, hotkeys, _, _ in wallet_hotkeys:
+        wallet = load_wallet(w["name"], base_path=base_path)
+        _ = wallet.coldkey  # unlock
+        wallet_plans.append((w["name"], wallet, hotkeys))
+
+    async def unstake_wallet(name, wallet, hotkeys):
+        results = []
+        for hk_ss58 in hotkeys:
+            try:
+                success, error = await unstake_all(client, wallet, hk_ss58)
+                results.append((name, hk_ss58, success, error))
+            except Exception as e:
+                results.append((name, hk_ss58, False, str(e)))
+        return results
+
+    if mode == "A":
+        all_results = []
+        for name, wallet, hotkeys in wallet_plans:
+            console.print(f"\n  [cyan]{name}[/cyan] ({len(hotkeys)} hotkeys)")
+            all_results.append(await unstake_wallet(name, wallet, hotkeys))
+    else:
+        console.print(f"  [dim]Starting parallel unstake ({len(wallet_plans)} wallets)...[/dim]")
         tasks = [unstake_wallet(n, w, hks) for n, w, hks in wallet_plans]
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        ok_count = 0
-        fail_count = 0
-        for result in all_results:
-            if isinstance(result, Exception):
-                print_error(f"Task failed: {result}")
+    ok_count = 0
+    fail_count = 0
+    for result in all_results:
+        if isinstance(result, Exception):
+            print_error(f"Wallet task failed: {result}")
+            fail_count += 1
+            continue
+        for name, hk_ss58, success, error in result:
+            if success:
+                print_success(f"{name}: unstaked {hk_ss58[:16]}...")
+                ok_count += 1
+            elif error and "NotEnoughStake" in str(error):
+                print_info(f"{name}: {hk_ss58[:16]} had no stake left")
+            else:
+                print_error(f"{name}: {hk_ss58[:16]} - {error}")
                 fail_count += 1
-                continue
-            for name, hk_ss58, amount, success, error in result:
-                if success:
-                    print_success(f"{name}: unstaked {amount:.4f} from HK {hk_ss58[:16]}...")
-                    ok_count += 1
-                else:
-                    if error and "AmountTooLow" in str(error):
-                        print_info(f"{name}: amount too low, skipping")
-                    else:
-                        print_error(f"{name}: {error}")
-                        fail_count += 1
 
-        console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
+    console.print(f"\n  Done: [green]{ok_count} ok[/green], [red]{fail_count} failed[/red]")
+
+
+async def _unstake_from_subnets(client: SubstrateClient, base_path: str):
+    """
+    Mode 2: unstake from one or more subnets, across any number of wallets.
+    Replaces the old single-wallet/single-subnet mode and the keep-amount mode.
+    """
+    console.print("  Subnet IDs: [cyan]78,14[/cyan] or a range [cyan]1-5[/cyan] or [cyan]all[/cyan]")
+    raw = Prompt.ask("Subnet(s)")
+    available = None
+    if raw.strip().lower() == "all":
+        try:
+            available = await client.get_all_subnet_netuids()
+        except Exception as e:
+            print_error(f"Could not list subnets: {e}")
+            return
+    netuids = _parse_netuids(raw, available)
+    if not netuids:
+        print_error("No valid subnet ids given")
+        return
+    console.print(f"  [dim]Subnets: {', '.join('SN' + str(n) for n in netuids)}[/dim]")
+
+    keep_amount = FloatPrompt.ask(
+        "Alpha to keep per wallet on each subnet (0 = unstake everything)", default=0.0
+    )
+    if keep_amount < 0:
+        print_error("Keep amount cannot be negative")
+        return
+
+    selected = select_wallets(base_path, "Select wallet(s) to unstake")
+    if not selected:
+        return
+
+    console.print(f"  [dim]Scanning {len(selected)} wallets on {len(netuids)} subnet(s)...[/dim]")
+    import time
+    t0 = time.time()
+    plan, failed = await _scan_stake_positions(client, selected, base_path, netuids=netuids)
+    for name, err in failed:
+        print_error(f"Failed to get stakes for {name}: {err}")
+    if not plan:
+        print_info("No stake found on the selected subnet(s) for these wallets")
+        return
+
+    meta = await _fetch_subnet_meta(client)
+    console.print(f"  [dim]Scanned in {time.time()-t0:.1f}s[/dim]")
+
+    # Build per-wallet, per-subnet unstake amounts
+    work = []       # (wallet_dict, [(netuid, hotkey, alpha_tao, unstake_tao, full)])
+    kept_all = []   # wallets whose stake stays below the keep amount
+    for w, addr, positions in plan:
+        by_subnet = {}
+        for netuid, hk, alpha_tao in positions:
+            by_subnet.setdefault(netuid, []).append((hk, alpha_tao))
+
+        items = []
+        for netuid in sorted(by_subnet):
+            hotkeys = by_subnet[netuid]
+            subnet_total = sum(a for _, a in hotkeys)
+            to_unstake = subnet_total - keep_amount
+            if to_unstake <= 0.0001:
+                kept_all.append((w["name"], netuid, subnet_total))
+                continue
+            full = keep_amount <= 0
+            for hk, alpha_tao in hotkeys:
+                if full:
+                    items.append((netuid, hk, alpha_tao, alpha_tao, True))
+                else:
+                    share = (alpha_tao / subnet_total) if subnet_total > 0 else 1.0 / len(hotkeys)
+                    amount = to_unstake * share
+                    if amount > 0.0001:
+                        items.append((netuid, hk, alpha_tao, amount, False))
+        if items:
+            work.append((w, items))
+
+    if not work:
+        if kept_all:
+            print_info(
+                f"Nothing to unstake: {len(kept_all)} wallet/subnet position(s) are at or below "
+                f"the keep amount of {keep_amount:.4f} alpha"
+            )
+        else:
+            print_info("Nothing to unstake")
+        return
+
+    # Preview: per-subnet totals always, per-wallet lines for small selections
+    per_subnet = {}
+    for w, items in work:
+        for netuid, hk, alpha_tao, amount, _ in items:
+            agg = per_subnet.setdefault(netuid, {"wallets": set(), "hotkeys": 0, "alpha": 0.0, "unstake": 0.0})
+            agg["wallets"].add(w["name"])
+            agg["hotkeys"] += 1
+            agg["alpha"] += alpha_tao
+            agg["unstake"] += amount
+
+    table = Table(title="Unstake plan", show_lines=False)
+    table.add_column("SN", style="cyan", justify="right")
+    table.add_column("Name", style="white")
+    table.add_column("Wallets", justify="right")
+    table.add_column("Hotkeys", justify="right")
+    table.add_column("α staked", justify="right", style="yellow")
+    table.add_column("α unstake", justify="right", style="bold yellow")
+    table.add_column("~τ out", justify="right", style="green")
+    total_unstake_alpha = 0.0
+    total_unstake_tao = 0.0
+    for netuid in sorted(per_subnet):
+        agg = per_subnet[netuid]
+        name, price = meta.get(netuid, (f"SN{netuid}", 0.0))
+        tao_est = agg["unstake"] if netuid == 0 else agg["unstake"] * price
+        total_unstake_alpha += agg["unstake"]
+        total_unstake_tao += tao_est
+        table.add_row(
+            str(netuid), name, str(len(agg["wallets"])), str(agg["hotkeys"]),
+            f"{agg['alpha']:.4f}", f"{agg['unstake']:.4f}", f"{tao_est:.4f}",
+        )
+    console.print(table)
+
+    if len(work) <= 20:
+        for w, items in work:
+            per_w = {}
+            for netuid, _, _, amount, _ in items:
+                per_w[netuid] = per_w.get(netuid, 0.0) + amount
+            detail = ", ".join(f"SN{n} {a:.4f}α" for n, a in sorted(per_w.items()))
+            console.print(f"  {w['name']:>14}: {detail}")
+
+    total_tx = sum(len(items) for _, items in work)
+    console.print(
+        f"\n  Total: unstake [bold yellow]{total_unstake_alpha:.4f} alpha[/bold yellow] "
+        f"(~[green]{total_unstake_tao:.4f} TAO[/green]) from "
+        f"[yellow]{len(work)} wallets[/yellow] in {total_tx} transaction(s)"
+    )
+    if keep_amount > 0:
+        console.print(f"  Keeping [cyan]{keep_amount:.4f} alpha[/cyan] per wallet on each subnet")
+    if kept_all:
+        console.print(f"  [dim]{len(kept_all)} position(s) left untouched (at or below keep amount)[/dim]")
+
+    if not Confirm.ask("Proceed?"):
+        return
+
+    console.print("  [dim]Unlocking coldkeys...[/dim]")
+    wallet_plans = []
+    for w, items in work:
+        wallet = load_wallet(w["name"], base_path=base_path)
+        _ = wallet.coldkey  # unlock
+        wallet_plans.append((w["name"], wallet, items))
+
+    async def unstake_wallet(name, wallet, items):
+        results = []
+        for netuid, hk, alpha_tao, amount, full in items:
+            try:
+                if full:
+                    success, error = await unstake_subnet(client, wallet, hk, netuid)
+                else:
+                    success, error = await remove_stake(client, wallet, hk, netuid, amount)
+                results.append((name, netuid, hk, amount, success, error))
+            except Exception as e:
+                results.append((name, netuid, hk, amount, False, str(e)))
+        return results
+
+    console.print(f"  [dim]Unstaking from {len(wallet_plans)} wallets in parallel...[/dim]")
+    tasks = [unstake_wallet(n, w, items) for n, w, items in wallet_plans]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    ok_count = 0
+    fail_count = 0
+    skipped = 0
+    done_alpha = 0.0
+    per_subnet_done = {}
+    failed_items = []
+    for result in all_results:
+        if isinstance(result, Exception):
+            print_error(f"Wallet task failed: {result}")
+            fail_count += 1
+            continue
+        for name, netuid, hk, amount, success, error in result:
+            if success:
+                print_success(f"{name}: unstaked {amount:.4f} α from SN{netuid} / {hk[:12]}...")
+                ok_count += 1
+                done_alpha += amount
+                per_subnet_done[netuid] = per_subnet_done.get(netuid, 0.0) + amount
+            elif error and ("AmountTooLow" in str(error) or "NotEnoughStake" in str(error)):
+                print_info(f"{name}: SN{netuid} / {hk[:12]} skipped ({str(error).split()[0]})")
+                skipped += 1
+            else:
+                print_error(f"{name}: SN{netuid} / {hk[:12]} - {error}")
+                fail_count += 1
+                failed_items.append((name, netuid, hk, amount))
+
+    console.print(
+        f"\n  Done: [green]{ok_count} ok[/green] ({done_alpha:.4f} alpha), "
+        f"[red]{fail_count} failed[/red], [dim]{skipped} skipped[/dim]"
+    )
+    if per_subnet_done:
+        for netuid in sorted(per_subnet_done):
+            name, _ = meta.get(netuid, (f"SN{netuid}", 0.0))
+            console.print(f"    SN{netuid} {name}: [yellow]{per_subnet_done[netuid]:.4f} alpha[/yellow]")
+
+    if failed_items and Confirm.ask(f"Retry {len(failed_items)} failed unstake(s) sequentially?"):
+        wallets_by_name = {n: w for n, w, _ in wallet_plans}
+        for name, netuid, hk, amount in failed_items:
+            wallet = wallets_by_name.get(name)
+            if wallet is None:
+                continue
+            console.print(f"  Retrying {name} SN{netuid} / {hk[:12]}...")
+            try:
+                success, error = await remove_stake(client, wallet, hk, netuid, amount)
+            except Exception as e:
+                success, error = False, str(e)
+            if success:
+                print_success(f"{name}: unstaked {amount:.4f} α from SN{netuid}")
+            else:
+                print_error(f"{name}: failed again - {error}")
+
+
+async def _unstake_exact_amount(client: SubstrateClient, base_path: str):
+    """Mode 3: precise partial unstake from one hotkey on one subnet."""
+    w = select_single_wallet(base_path)
+    if not w:
+        return
+    hk_names = select_hotkey(w)
+    if not hk_names or len(hk_names) > 1:
+        print_error("Select exactly one hotkey for partial unstake")
+        return
+    hk_name = hk_names[0]
+    wallet = load_wallet(w["name"], hk_name, base_path)
+    hotkey_ss58 = wallet.hotkey.ss58_address
+    netuid = IntPrompt.ask("Subnet ID (netuid)")
+    amount = FloatPrompt.ask("Amount of ALPHA to unstake")
+    if amount <= 0:
+        print_error("Amount must be > 0")
+        return
+    if not Confirm.ask(f"Unstake {amount} alpha from SN{netuid}?"):
+        return
+    console.print("  [dim]Unlocking coldkey...[/dim]")
+    _ = wallet.coldkey
+    success, error = await remove_stake(client, wallet, hotkey_ss58, netuid, amount)
+    if success:
+        print_success(f"Unstaked {amount} alpha from SN{netuid}")
+    else:
+        print_error(f"Unstake failed: {error}")
 
 
 # ========================================================================
