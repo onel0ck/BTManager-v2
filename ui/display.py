@@ -45,15 +45,22 @@ def display_balance_table(balances: list[dict], tao_price: float = None):
 
     total_free = 0.0
     total_staked = 0.0
+    unknown_staked = 0
     for b in balances:
         free = b["free_tao"]
         staked = b.get("staked_tao", 0.0)
-        total = free + staked
         total_free += free
-        total_staked += staked
-        row = [b.get("name", ""), b["address"], f"{free:.6f}", f"{staked:.6f}", f"{total:.6f}"]
+        if staked is None:
+            unknown_staked += 1
+            staked_str, total_str = "?", f"{free:.6f}"
+            usd_str = f"${free * tao_price:,.2f}" if tao_price else None
+        else:
+            total_staked += staked
+            staked_str, total_str = f"{staked:.6f}", f"{free + staked:.6f}"
+            usd_str = f"${(free + staked) * tao_price:,.2f}" if tao_price else None
+        row = [b.get("name", ""), b["address"], f"{free:.6f}", staked_str, total_str]
         if tao_price:
-            row.append(f"${total * tao_price:,.2f}")
+            row.append(usd_str)
         table.add_row(*row)
 
     grand = total_free + total_staked
@@ -64,6 +71,11 @@ def display_balance_table(balances: list[dict], tao_price: float = None):
     table.add_row(*total_row)
 
     console.print(table)
+    if unknown_staked:
+        console.print(
+            f"  [yellow]Staked amount unknown for {unknown_staked} wallet(s); "
+            f"totals exclude them[/yellow]"
+        )
     if tao_price:
         console.print(f"  TAO price: [yellow]${tao_price:.2f}[/yellow]")
 
@@ -167,9 +179,11 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]], burn_costs: di
             tao_price = stats["tao_price_usd"]
         console.print()
 
-    if len(all_stats) > 1:
+    if all_stats:
         console.print(f"[bold cyan]{'─' * 50}[/bold cyan]")
-        console.print(f"[bold]GRAND TOTAL ({len(all_stats)} wallets):[/bold]")
+        label = "GRAND TOTAL" if len(all_stats) > 1 else "TOTAL"
+        wallet_word = "wallets" if len(all_stats) > 1 else "wallet"
+        console.print(f"[bold]{label} ({len(all_stats)} {wallet_word}):[/bold]")
         console.print(f"  Free: [green]{grand_free:.4f}[/green] TAO")
         console.print(f"  Staked: [yellow]{grand_staked:.4f}[/yellow] TAO (est.)")
         console.print(f"  Total: [bold green]{grand_total:.4f}[/bold green] TAO")

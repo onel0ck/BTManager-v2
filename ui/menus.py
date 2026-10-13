@@ -9,17 +9,17 @@ from rich.table import Table
 from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao, decode_price, decode_bytes
 from core.wallet_ops import (
     list_wallets, load_wallet, get_coldkey_ss58,
-    create_coldkey_with_hotkeys, add_hotkeys_to_wallet, create_hotkey,
+    create_coldkey_with_hotkeys, add_hotkeys_to_wallet,
     batch_create_wallets,
 )
-from core.balance import check_balance, check_all_balances
+from core.balance import check_balance
 from core.staking import add_stake, remove_stake, unstake_all, unstake_subnet
 from core.registration import burn_register, get_registration_info, check_registration_status
-from core.transfer import transfer_tao, transfer_tao_keep_alive
+from core.transfer import transfer_tao_keep_alive
 from core.stats import get_wallet_stats, get_subnet_overview, fetch_tao_price
 from ui.display import (
     console, print_header, print_success, print_error, print_warn, print_info,
-    display_balance_table, display_wallet_stats, display_multi_wallet_stats,
+    display_balance_table, display_multi_wallet_stats,
     display_subnet_overview, display_wallet_list,
 )
 from utils.wallet_groups import load_groups, create_group, delete_group, get_group, list_group_names
@@ -134,8 +134,16 @@ def select_wallets(base_path: str, prompt: str = "Select wallet(s)", allow_multi
 
 
 def select_single_wallet(base_path: str, prompt: str = "Select wallet") -> dict | None:
+    """Select exactly one wallet; warn instead of silently dropping extra matches."""
     result = select_wallets(base_path, prompt=prompt, allow_multi=False)
-    return result[0] if result else None
+    if not result:
+        return None
+    if len(result) > 1:
+        print_warn(
+            f"This mode takes one wallet: using [cyan]{result[0]['name']}[/cyan], "
+            f"ignoring the other {len(result) - 1}"
+        )
+    return result[0]
 
 
 def select_hotkey(wallet: dict) -> list[str] | None:
@@ -271,21 +279,38 @@ async def handle_check_balances(client: SubstrateClient, config: dict):
         return
 
     console.print(f"  Checking {len(addresses)} wallets...")
-    tao_price = await fetch_tao_price()
+    tao_price, shared_dynamic = await asyncio.gather(
+        fetch_tao_price(), client.get_all_dynamic_info(), return_exceptions=True
+    )
+    if isinstance(tao_price, Exception):
+        tao_price = None
+    if isinstance(shared_dynamic, Exception):
+        print_warn(f"Could not fetch subnet prices: {shared_dynamic}")
+        shared_dynamic = None
+
+    stake_errors = []
 
     async def get_balance_with_stake(a):
         bal = await check_balance(client, a["address"])
         bal["name"] = a["name"]
         try:
-            stats = await get_wallet_stats(client, a["address"], include_usd=False)
+            stats = await get_wallet_stats(
+                client, a["address"], include_usd=False, shared_dynamic=shared_dynamic
+            )
             bal["staked_tao"] = stats.get("total_staked_tao", 0.0)
-        except Exception:
-            bal["staked_tao"] = 0.0
+        except Exception as e:
+            bal["staked_tao"] = None  # unknown, not zero
+            stake_errors.append((a["name"], str(e)))
         return bal
 
     tasks = [get_balance_with_stake(a) for a in addresses]
     balances = await asyncio.gather(*tasks, return_exceptions=True)
     balances = [b for b in balances if not isinstance(b, Exception)]
+
+    for name, err in stake_errors[:5]:
+        print_warn(f"Stake unknown for {name}: {err}")
+    if len(stake_errors) > 5:
+        print_warn(f"... and {len(stake_errors) - 5} more wallets with unknown stake")
 
     display_balance_table(balances, tao_price=tao_price)
 
@@ -377,7 +402,7 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
     console.print(f"  [dim]Stats loaded in {t2-t1:.1f}s (total {t2-t0:.1f}s)[/dim]")
 
     burn_costs = None
-    if len(all_stats) > 1:
+    if all_stats:
         reg_netuids = sorted({
             s["netuid"] for _, st in all_stats
             for s in st.get("subnets", []) if s.get("is_registered")
@@ -617,7 +642,7 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
             console.print(f" [yellow](${d_total_value * tao_price:,.2f})[/yellow]")
         else:
             console.print()
-        print_info("These can be unstaked via Unstake mode (specific subnet)")
+        print_info("These can be unstaked via Unstake -> mode 2 (from subnet(s))")
 
     # Summary
     unique_wallets = sorted(set(wname for wname, _, _, _, _, _, _, _ in registered))
@@ -675,6 +700,10 @@ async def handle_register(client: SubstrateClient, config: dict):
     burn_tao = info["burn_cost_tao"]
     burn_usd = f" (${burn_tao * tao_price:.4f})" if tao_price else ""
     console.print(f"\n  Burn cost: [yellow]{burn_tao:.9f} TAO{burn_usd}[/yellow]")
+    if info.get("registration_allowed") is False:
+        print_warn(f"Registration is currently CLOSED on SN{netuid} — every attempt will fail")
+        if not Confirm.ask("Try anyway?", default=False):
+            return
     if info.get("current_neurons") is not None:
         console.print(f"  Neurons: {info['current_neurons']} / {info.get('max_neurons', '?')}")
 
@@ -696,7 +725,7 @@ async def handle_register(client: SubstrateClient, config: dict):
         if not Confirm.ask(f"Register {len(hotkey_names)} hotkeys on SN{netuid}?"):
             return
 
-    wallet_obj = None
+    signer = None  # coldkey is unlocked once and reused for every hotkey
     for hk in hotkey_names:
         wallet = load_wallet(w["name"], hk, base_path)
         hotkey_ss58 = wallet.hotkey.ss58_address
@@ -711,14 +740,14 @@ async def handle_register(client: SubstrateClient, config: dict):
             if not Confirm.ask(f"Register on SN{netuid} for {burn_tao:.9f} TAO?"):
                 return
 
-        if wallet_obj is None:
+        if signer is None:
             console.print("  [dim]Unlocking coldkey...[/dim]")
-            _ = wallet.coldkey
-            wallet_obj = wallet
+            _ = wallet.coldkey  # decrypt once, reuse for the whole batch
+            signer = wallet
 
         console.print("  [dim]Submitting registration...[/dim]")
         success, error, uid = await burn_register(
-            client, wallet, hotkey_ss58, netuid,
+            client, signer, hotkey_ss58, netuid,
             limit_price_tao=limit_price_tao,
         )
         if success:
@@ -985,9 +1014,8 @@ async def _transfer_batch(client, base_path):
     console.print("  [dim]Unlocking coldkey...[/dim]")
     _ = wallet.coldkey
 
-    if mode == "2" and len(transfers) > 1:
+    if len(transfers) > 1:
         # Use utility.batch_all — single tx, single block
-        from core.substrate_client import tao_to_rao
         calls = []
         for dest_ss58, amt, label in transfers:
             calls.append({
@@ -1175,7 +1203,6 @@ async def _transfer_collect(client, base_path):
 
 async def _transfer_collect_alpha(client, base_path):
     """Collect alpha tokens from multiple wallets to one destination via move_stake + transfer_stake."""
-    from core.substrate_client import tao_to_rao
     from core.stats import decode_ss58
 
     TAOSTATS_VALIDATOR = "5GKH9FPPnWSUoeeTJp19wVtd84XqFW4pyK2ijV2GsFbhTrP1"
@@ -1285,7 +1312,6 @@ async def _transfer_collect_alpha(client, base_path):
 
     # Group by wallet for batching
     # For each source coldkey, build batch: move_stake(s) + transfer_stake(s)
-    from itertools import groupby
     wallet_groups = {}
     for name, coldkey_ss58, hotkey_ss58, alpha_rao, alpha_tao in collect_plan:
         if name not in wallet_groups:
@@ -1334,8 +1360,9 @@ async def _transfer_collect_alpha(client, base_path):
                 })
 
             if not needs_move and not needs_transfer:
-                # Already at destination
-                return (name, True, "already at destination")
+                # This position is already at the destination; other positions
+                # of the same wallet still need their calls (do NOT return here)
+                continue
 
         if not calls:
             return (name, True, "nothing to do")
@@ -1376,7 +1403,7 @@ async def _transfer_collect_alpha(client, base_path):
 
 async def _transfer_distribute_alpha(client, base_path):
     """Distribute alpha from one source wallet to multiple destination wallets via transfer_stake."""
-    from core.substrate_client import tao_to_rao, rao_to_tao
+
     from core.stats import decode_ss58
 
     TAOSTATS_VALIDATOR = "5GKH9FPPnWSUoeeTJp19wVtd84XqFW4pyK2ijV2GsFbhTrP1"
@@ -1530,12 +1557,9 @@ async def _transfer_distribute_alpha(client, base_path):
                     continue
 
             if not wallet_added:
-                has_registered = any(
-                    True for hk_name in (w.get("hotkeys") or [])
-                    if hk_name  # just check we tried
+                console.print(
+                    f"  [yellow]{w['name']}: no registered hotkey on SN{netuid}, skipping[/yellow]"
                 )
-                if not has_registered:
-                    console.print(f"  [yellow]{w['name']}: no registered hotkey on SN{netuid}, skipping[/yellow]")
 
     if not dist_plan:
         if skipped_count > 0:
@@ -1867,6 +1891,13 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
     console.print("  [dim]Unlocking coldkey...[/dim]")
     _ = wallet.coldkey
 
+    try:
+        stake_before_rao = await client.get_stake_for_hotkey_coldkey_netuid(
+            hotkey_ss58, ck_addr, netuid
+        )
+    except Exception:
+        stake_before_rao = None
+
     console.print("  [dim]Submitting...[/dim]")
     success, error = await add_stake(
         client, wallet, hotkey_ss58, netuid, amount_tao,
@@ -1883,7 +1914,13 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
                 client.get_stake_for_hotkey_coldkey_netuid(hotkey_ss58, ck_addr, netuid),
             )
             tao_spent = bal["free_tao"] - new_bal["free_tao"]
-            alpha_received = rao_to_tao(new_stake_rao)
+            if stake_before_rao is None:
+                # No pre-tx snapshot: this is the total on the hotkey, not the delta
+                alpha_received = rao_to_tao(new_stake_rao)
+                alpha_is_total = True
+            else:
+                alpha_received = rao_to_tao(new_stake_rao - stake_before_rao)
+                alpha_is_total = False
 
             console.print(f"  TAO spent   : [yellow]{tao_spent:.6f} TAO[/yellow]", end="")
             if tao_spent < amount_tao - 0.000001:
@@ -1891,7 +1928,11 @@ async def handle_add_stake(client: SubstrateClient, config: dict):
                 console.print(f"  [dim](partial fill: {pct:.1f}% of {amount_tao:.4f} requested)[/dim]")
             else:
                 console.print()
-            console.print(f"  {alpha_symbol} received : [green]{alpha_received:.4f} {alpha_symbol}[/green]", end="")
+            alpha_label = "total   " if alpha_is_total else "received"
+            console.print(
+                f"  {alpha_symbol} {alpha_label} : [green]{alpha_received:.4f} {alpha_symbol}[/green]",
+                end="",
+            )
             if tao_spent > 0:
                 actual_rate = tao_spent / alpha_received if alpha_received > 0 else 0
                 console.print(f"  [dim](rate: {1/actual_rate:.4f} {alpha_symbol}/TAO)[/dim]" if actual_rate > 0 else "")
@@ -2465,7 +2506,8 @@ async def _pruning_prediction(client, config, netuid, top_n=30):
         result = await client.substrate.query(
             module="SubtensorModule", storage_function="ImmuneOwnerUidsLimit", params=[netuid],
         )
-        immune_owner_limit = result.value if hasattr(result, "value") else (result or 3)
+        raw_limit = result.value if hasattr(result, "value") else result
+        immune_owner_limit = int(raw_limit) if raw_limit is not None else 3
     except Exception:
         immune_owner_limit = 3
 
@@ -2936,7 +2978,7 @@ def _manage_collect_addresses(base_path: str):
         families = {family(n) for n in added + unchanged + [u[0] for u in updated] if family(n) != n}
         missing = sorted(
             (n for n in wallet_names if n not in bound and family(n) in families),
-            key=lambda n: (family(n), int(re.search(r"\d+$", n).group())),
+            key=lambda n: (family(n), int((re.search(r"\d+$", n).group() if re.search(r"\d+$", n) else 0))),
         )
         if missing:
             print_warn(f"Still without binding: {', '.join(missing)}")
