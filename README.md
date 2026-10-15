@@ -44,6 +44,12 @@ python main.py
 **Subnet Info**
 - Browse all subnets with prices, emission, and registration cost
 
+**Find Address**
+- Paste any SS58 address and see whether it is yours, as a coldkey or a hotkey
+- For a hotkey it shows the hotkey name and the coldkey it belongs to
+- Batch mode: paste many addresses at once, or point it at a text file
+- Local only, reads just the public address from the wallet files
+
 ## Configuration
 
 Edit `config.yaml`:

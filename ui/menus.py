@@ -25,6 +25,7 @@ from ui.display import (
     display_subnet_overview, display_wallet_list,
 )
 from utils.wallet_groups import load_groups, create_group, delete_group, get_group, list_group_names
+from core.address_book import build_address_index, parse_address_input, lookup
 from utils.collect_addresses import (
     load_collect_addresses, save_collect_addresses, set_collect_address, delete_collect_address,
     parse_bindings, is_valid_ss58,
@@ -40,6 +41,7 @@ MENU_OPTIONS = [
     ("7", "Subnet Info"),
     ("8", "Wallet Groups"),
     ("9", "Add Stake"),
+    ("10", "Find Address (coldkey/hotkey lookup)"),
     ("0", "Exit"),
 ]
 
@@ -3100,6 +3102,138 @@ async def handle_wallet_groups(config: dict):
 
 
 # ========================================================================
+# 10. Find Address
+# ========================================================================
+
+def _shorten(addr: str, head: int = 10, tail: int = 6) -> str:
+    return addr if len(addr) <= head + tail + 1 else f"{addr[:head]}…{addr[-tail:]}"
+
+
+async def handle_address_lookup(config: dict):
+    print_header("Find Address")
+    base_path = config["wallet"]["base_path"]
+
+    console.print("  Paste one address or a whole batch: [cyan]coldkey or hotkey SS58[/cyan]")
+    console.print("  [dim]Separate with commas, spaces or newlines. A wallet name also works.[/dim]")
+    console.print("  [dim]Many addresses? Put them in a text file and enter its path instead.[/dim]")
+    try:
+        raw = console.input("  > ").strip()
+    except EOFError:
+        raw = ""
+    if not raw:
+        print_info("Nothing entered")
+        return
+
+    from pathlib import Path
+    maybe_file = Path(raw).expanduser()
+    if len(raw.split()) == 1 and "," not in raw and maybe_file.is_file():
+        try:
+            raw = maybe_file.read_text()
+            print_info(f"Read addresses from {maybe_file}")
+        except OSError as e:
+            print_error(f"Can't read {maybe_file}: {e}")
+            return
+
+    tokens = parse_address_input(raw)
+    if not tokens:
+        print_error("No addresses found in the input")
+        return
+
+    import time
+    t0 = time.time()
+    index = build_address_index(base_path)
+    console.print(
+        f"  [dim]Indexed {len(index['wallets'])} wallets, {len(index['coldkeys'])} coldkeys, "
+        f"{len(index['hotkeys'])} hotkeys in {time.time()-t0:.2f}s[/dim]"
+    )
+    if index["unreadable"]:
+        print_warn(f"{len(index['unreadable'])} key file(s) could not be read")
+
+    seen = set()
+    results = []
+    for tok in tokens:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        results.append(lookup(tok, index))
+
+    # Single lookup: answer in plain lines with the full address
+    if len(results) == 1:
+        r = results[0]
+        console.print(f"\n  [bold]{r['query']}[/bold]")
+        if r["kind"] in ("coldkey", "hotkey", "both"):
+            for m in r["matches"]:
+                if m.get("hotkey"):
+                    ck = index["wallets"].get(m["wallet"], {}).get("coldkey") or "?"
+                    print_success(
+                        f"hotkey [cyan]{m['hotkey']}[/cyan] of coldkey [cyan]{m['wallet']}[/cyan]"
+                    )
+                    console.print(f"      coldkey address: [dim]{ck}[/dim]")
+                else:
+                    hk_count = len(index["wallets"].get(m["wallet"], {}).get("hotkeys", {}))
+                    print_success(f"coldkey [cyan]{m['wallet']}[/cyan] ({hk_count} hotkeys)")
+        elif r["kind"] == "wallet_name":
+            m = r["matches"][0]
+            print_success(f"wallet name [cyan]{m['wallet']}[/cyan], {m['hotkey_count']} hotkeys")
+            console.print(f"      coldkey address: [dim]{m['coldkey'] or '?'}[/dim]")
+        elif r["kind"] == "unknown":
+            print_warn("not found in your local wallets")
+        else:
+            print_error("this does not look like an SS58 address or a wallet name")
+        return
+
+    # Batch: one row per match
+    table = Table(title=f"Address lookup ({len(results)} queries)", show_lines=False)
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Address / name", no_wrap=True)
+    table.add_column("Type")
+    table.add_column("Coldkey name", style="cyan")
+    table.add_column("Hotkey name", style="bold white")
+
+    counts = {"coldkey": 0, "hotkey": 0, "unknown": 0, "not_an_address": 0, "wallet_name": 0}
+    not_found = []
+    for i, r in enumerate(results, 1):
+        kind = r["kind"]
+        if kind == "both":
+            counts["coldkey"] += 1
+            counts["hotkey"] += 1
+        elif kind in counts:
+            counts[kind] += 1
+
+        if kind in ("coldkey", "hotkey", "both"):
+            for m in r["matches"]:
+                if m.get("hotkey"):
+                    table.add_row(str(i), _shorten(r["query"]), "[green]hotkey[/green]",
+                                  m["wallet"], m["hotkey"])
+                else:
+                    hk_count = len(index["wallets"].get(m["wallet"], {}).get("hotkeys", {}))
+                    table.add_row(str(i), _shorten(r["query"]), "[green]coldkey[/green]",
+                                  m["wallet"], f"[dim]{hk_count} hotkeys[/dim]")
+        elif kind == "wallet_name":
+            m = r["matches"][0]
+            table.add_row(str(i), r["query"], "[cyan]wallet name[/cyan]", m["wallet"],
+                          f"[dim]{m['hotkey_count']} hotkeys[/dim]")
+        elif kind == "unknown":
+            table.add_row(str(i), _shorten(r["query"]), "[yellow]not yours[/yellow]", "-", "-")
+            not_found.append(r["query"])
+        else:
+            table.add_row(str(i), _shorten(r["query"]), "[red]not an address[/red]", "-", "-")
+            not_found.append(r["query"])
+
+    console.print(table)
+    console.print(
+        f"  [green]{counts['coldkey']} coldkey(s)[/green], "
+        f"[green]{counts['hotkey']} hotkey(s)[/green], "
+        f"[yellow]{counts['unknown']} not yours[/yellow], "
+        f"[red]{counts['not_an_address']} unparsable[/red]"
+    )
+    if not_found:
+        console.print("  [dim]Not found:[/dim]")
+        for addr in not_found:
+            console.print(f"    [dim]{addr}[/dim]")
+
+
+# ========================================================================
 # Main loop
 # ========================================================================
 
@@ -3113,6 +3247,7 @@ HANDLERS = {
     "7": handle_subnet_info,
     "8": handle_wallet_groups,
     "9": handle_add_stake,
+    "10": handle_address_lookup,
 }
 
 
@@ -3126,10 +3261,13 @@ async def main_menu_loop(client: SubstrateClient, config: dict):
         handler = HANDLERS.get(choice)
         if handler:
             try:
-                if choice in ("1", "8"):
-                    await handler(config)
+                # some handlers are local-only and take just the config
+                import inspect
+                takes_client = "client" in inspect.signature(handler).parameters
+                if takes_client:
+                    await handler(client, config)
                 else:
-                    await handler(client, config)  # all others take (client, config)
+                    await handler(config)
             except KeyboardInterrupt:
                 console.print("\n  [dim]Cancelled[/dim]")
             except Exception as e:
