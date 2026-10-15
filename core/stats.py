@@ -6,7 +6,9 @@ Uses global neuron cache for fast registration lookups.
 
 import asyncio
 from typing import Optional
-from core.substrate_client import SubstrateClient, rao_to_tao, decode_price, decode_bytes
+from core.substrate_client import (
+    SubstrateClient, rao_to_tao, decode_price, decode_bytes, subnet_spot_price,
+)
 from utils.logger import setup_logger
 
 logger = setup_logger("stats")
@@ -200,14 +202,16 @@ async def get_wallet_stats(
     if shared_price is not None:
         results["price"] = shared_price
 
-    price_map = {}
+    price_map = {}   # spot price (tao_in/alpha_in) — used for all valuation
+    ema_map = {}     # moving_price EMA — kept for reference only
     name_map = {}
     tempo_map = {}
     if results.get("dynamic"):
         for info in results["dynamic"]:
             if isinstance(info, dict):
                 netuid = info.get("netuid", 0)
-                price_map[netuid] = decode_price(info.get("moving_price", 0))
+                price_map[netuid] = subnet_spot_price(info)
+                ema_map[netuid] = decode_price(info.get("moving_price", 0))
                 tempo_map[netuid] = info.get("tempo", 360)
                 identity = info.get("subnet_identity")
                 if identity and isinstance(identity, dict):
@@ -231,13 +235,13 @@ async def get_wallet_stats(
         hotkey = decode_ss58(entry.get("hotkey", ""))
         alpha_stake_rao = entry.get("stake", 0)
         alpha_tao = rao_to_tao(alpha_stake_rao)
-        moving_price = price_map.get(netuid, 0.0)
+        spot_price = price_map.get(netuid, 0.0)
         tempo = tempo_map.get(netuid, 360)
 
         if netuid == 0:
-            tao_value = alpha_tao
-        elif moving_price > 0:
-            tao_value = alpha_tao * moving_price
+            tao_value = alpha_tao  # root: alpha is TAO
+        elif spot_price > 0:
+            tao_value = alpha_tao * spot_price
         else:
             tao_value = 0.0
 
@@ -254,7 +258,10 @@ async def get_wallet_stats(
         if neuron_data:
             # emission is alpha RAO per tempo -> convert to TAO per block
             emission_alpha_per_tempo = rao_to_tao(neuron_data["emission"])
-            emission_tao_per_tempo = emission_alpha_per_tempo * moving_price if moving_price > 0 else 0.0
+            emission_tao_per_tempo = (
+                emission_alpha_per_tempo * (1.0 if netuid == 0 else spot_price)
+                if (netuid == 0 or spot_price > 0) else 0.0
+            )
             emission_tao_per_block = emission_tao_per_tempo / tempo if tempo > 0 else 0.0
             uid = neuron_data["uid"]
             incentive = neuron_data["incentive"]
@@ -286,7 +293,8 @@ async def get_wallet_stats(
                 "emission": emission_tao_per_block,
                 "incentive": incentive,
                 "is_registered": is_registered,
-                "moving_price": moving_price,
+                "price": spot_price,
+                "moving_price": ema_map.get(netuid, 0.0),
             })
 
     # Add registered hotkeys with 0 stake (from neuron cache)
@@ -300,7 +308,10 @@ async def get_wallet_stats(
                 mp = price_map.get(netuid, 0.0)
                 tempo = tempo_map.get(netuid, 360)
                 emission_alpha_per_tempo = rao_to_tao(nd["emission"])
-                emission_tao_per_tempo = emission_alpha_per_tempo * mp if mp > 0 else 0.0
+                emission_tao_per_tempo = (
+                    emission_alpha_per_tempo * (1.0 if netuid == 0 else mp)
+                    if (netuid == 0 or mp > 0) else 0.0
+                )
                 emission_tao_per_block = emission_tao_per_tempo / tempo if tempo > 0 else 0.0
                 total_emission_tao_per_block += emission_tao_per_block
                 subnets.append({
@@ -314,7 +325,8 @@ async def get_wallet_stats(
                     "emission": emission_tao_per_block,
                     "incentive": nd["incentive"],
                     "is_registered": True,
-                    "moving_price": mp,
+                    "price": mp,
+                    "moving_price": ema_map.get(netuid, 0.0),
                 })
 
     subnets.sort(key=lambda x: x["netuid"])
@@ -374,7 +386,9 @@ async def get_subnet_overview(
         "symbol": symbol or "?",
         "tempo": info.get("tempo", 0),
         "tao_in": rao_to_tao(info.get("tao_in", 0)),
+        "alpha_in": rao_to_tao(info.get("alpha_in", 0)),
         "alpha_out": rao_to_tao(info.get("alpha_out", 0)),
+        "price": subnet_spot_price(info),
         "moving_price": decode_price(info.get("moving_price", 0)),
         "burn_cost_tao": rao_to_tao(burn_rao),
         "burn_cost_rao": burn_rao,

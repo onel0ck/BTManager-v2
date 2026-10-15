@@ -6,7 +6,9 @@ import asyncio
 from rich.prompt import Prompt, IntPrompt, Confirm, FloatPrompt
 from rich.table import Table
 
-from core.substrate_client import SubstrateClient, rao_to_tao, tao_to_rao, decode_price, decode_bytes
+from core.substrate_client import (
+    SubstrateClient, rao_to_tao, tao_to_rao, decode_price, decode_bytes, subnet_spot_price,
+)
 from core.wallet_ops import (
     list_wallets, load_wallet, get_coldkey_ss58,
     create_coldkey_with_hotkeys, add_hotkeys_to_wallet,
@@ -448,11 +450,15 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         dynamic_task, neurons_task, price_task, return_exceptions=True
     )
 
-    moving_price = 0.0
+    spot_price = 0.0
+    ema_price = 0.0
     tempo = 360
     if not isinstance(dynamic_info, Exception) and dynamic_info:
-        moving_price = decode_price(dynamic_info.get("moving_price", 0))
+        spot_price = subnet_spot_price(dynamic_info)
+        ema_price = decode_price(dynamic_info.get("moving_price", 0))
         tempo = dynamic_info.get("tempo", 360)
+        if netuid == 0:
+            spot_price = 1.0
     if isinstance(tao_price, Exception):
         tao_price = None
 
@@ -466,6 +472,11 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
 
     t1 = time.time()
     console.print(f"  [dim]Subnet data loaded in {t1-t0:.1f}s ({len(neurons_map)} neurons)[/dim]")
+    if spot_price > 0:
+        note = f"  [dim]Price used: {spot_price:.8f} TAO/alpha (pool spot)"
+        if ema_price > 0 and abs(spot_price - ema_price) / ema_price > 0.05:
+            note += f", EMA is {ema_price:.8f}"
+        console.print(note + "[/dim]")
 
     # Phase 2: Load all hotkey SS58 addresses from disk (sync, fast)
     console.print(f"  [dim]Loading hotkey addresses from {len(selected)} wallets...[/dim]")
@@ -534,10 +545,10 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         registered_hk_set.add(hk_ss58)
         alpha_rao = coldkey_stakes.get(ck_ss58, {}).get(hk_ss58, 0)
         alpha_tao = rao_to_tao(alpha_rao)
-        tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
+        tao_value = alpha_tao * spot_price if spot_price > 0 else 0.0
 
         emission_alpha_per_tempo = rao_to_tao(neuron.get("emission", 0))
-        emission_tao_per_tempo = emission_alpha_per_tempo * moving_price if moving_price > 0 else 0.0
+        emission_tao_per_tempo = emission_alpha_per_tempo * spot_price if spot_price > 0 else 0.0
         emission_tao_per_block = emission_tao_per_tempo / tempo if tempo > 0 else 0.0
         daily_tao = emission_tao_per_block * BLOCKS_PER_DAY
         incentive = neuron.get("incentive", 0)
@@ -552,7 +563,7 @@ async def _check_subnet_registrations(client: SubstrateClient, config: dict):
         alpha_rao = coldkey_stakes.get(ck_ss58, {}).get(hk_ss58, 0)
         if alpha_rao and alpha_rao > 0:
             alpha_tao = rao_to_tao(alpha_rao)
-            tao_value = alpha_tao * moving_price if moving_price > 0 else 0.0
+            tao_value = alpha_tao * spot_price if spot_price > 0 else 0.0
             deregistered.append((wname, hk_name, hk_ss58, alpha_tao, tao_value))
             wallet_has_reg[wname] = True  # has alpha here, not "not registered"
 
@@ -2007,8 +2018,7 @@ def _parse_netuids(raw: str, available: list[int] = None) -> list[int]:
 
 
 async def _fetch_subnet_meta(client: SubstrateClient) -> dict:
-    """Return {netuid: (name, moving_price)} for display. Empty dict on failure."""
-    from core.substrate_client import decode_price, decode_bytes
+    """Return {netuid: (name, spot_price)} for display. Empty dict on failure."""
     try:
         dynamic = await client.get_all_dynamic_info()
     except Exception as e:
@@ -2025,7 +2035,7 @@ async def _fetch_subnet_meta(client: SubstrateClient) -> dict:
         else:
             raw = info.get("subnet_name", ())
         name = (decode_bytes(raw) if raw else "") or f"SN{netuid}"
-        meta[netuid] = (name, decode_price(info.get("moving_price", 0)))
+        meta[netuid] = (name, subnet_spot_price(info))
     return meta
 
 

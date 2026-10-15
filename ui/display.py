@@ -247,16 +247,22 @@ def display_subnet_overview(info: dict, tao_price: float = None):
     table.add_row("Symbol", info.get("symbol", "?"))
     table.add_row("Tempo", str(info.get("tempo", "?")))
 
-    mp = info.get("moving_price", 0)
-    table.add_row("Price", f"{mp:.6f} TAO/alpha")
-    if tao_price and mp:
-        table.add_row("Price (USD)", f"${mp * tao_price:.4f} / alpha")
+    spot = info.get("price", 0) or info.get("moving_price", 0)
+    ema = info.get("moving_price", 0)
+    table.add_row("Price (spot)", f"{spot:.6f} TAO/alpha")
+    if tao_price and spot:
+        table.add_row("Price (USD)", f"${spot * tao_price:.4f} / alpha")
+    if ema and spot and abs(spot - ema) / ema > 0.01:
+        table.add_row("Price (EMA)", f"{ema:.6f} TAO/alpha [dim](lags the pool)[/dim]")
 
     tao_in = info.get("tao_in", 0)
     table.add_row("Pool (TAO side)", f"{tao_in:,.4f} TAO")
     if tao_price and tao_in:
         table.add_row("Pool (USD)", f"${tao_in * tao_price:,.2f}")
-    table.add_row("Pool (Alpha side)", f"{info.get('alpha_out', 0):,.4f}")
+    alpha_in = info.get("alpha_in")
+    if alpha_in:
+        table.add_row("Pool (Alpha side)", f"{alpha_in:,.4f}")
+    table.add_row("Alpha outside pool", f"{info.get('alpha_out', 0):,.4f}")
 
     if "burn_cost_tao" in info:
         burn_str = f"{info['burn_cost_tao']:.9f} TAO"

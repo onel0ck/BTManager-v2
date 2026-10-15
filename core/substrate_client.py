@@ -41,6 +41,28 @@ def decode_price(price_raw) -> float:
     return bits / I64F64_DIVISOR
 
 
+def subnet_spot_price(info: dict) -> float:
+    """
+    AMM spot price of a subnet in TAO per alpha: tao_in / alpha_in.
+
+    This is the price an unstake actually executes against, and the one
+    explorers show. `moving_price` is a slow EMA that can lag the pool by
+    an order of magnitude on young or fast-moving subnets, so it must not
+    be used to value holdings or emission.
+    Falls back to the EMA when the pool side is missing.
+    """
+    if not isinstance(info, dict):
+        return 0.0
+    try:
+        tao_in = rao_to_tao(info.get("tao_in", 0) or 0)
+        alpha_in = rao_to_tao(info.get("alpha_in", 0) or 0)
+        if tao_in > 0 and alpha_in > 0:
+            return tao_in / alpha_in
+    except (TypeError, ValueError):
+        pass
+    return decode_price(info.get("moving_price", 0))
+
+
 def decode_bytes(data) -> str:
     """
     Decode byte tuple/list from chain into string.
