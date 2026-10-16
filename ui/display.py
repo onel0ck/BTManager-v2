@@ -4,6 +4,7 @@ Display helpers using Rich for formatted output.
 
 from rich.console import Console
 from rich.table import Table
+from rich.padding import Padding
 
 console = Console()
 
@@ -155,13 +156,149 @@ def display_wallet_stats(stats: dict, wallet_name: str = ""):
         console.print("  [dim]No registrations found[/dim]")
 
 
-def display_multi_wallet_stats(all_stats: list[tuple[str, dict]], burn_costs: dict = None):
+def display_emission_breakdown(
+    all_stats: list[tuple[str, dict]],
+    tao_price: float = None,
+    top_n: int = 8,
+):
+    """
+    Compact 'where does the farm come from' summary for the bottom of the
+    stats output: top subnets and top wallets by daily emission, so a run
+    over many wallets does not have to be scrolled back.
+    """
+    per_subnet = {}   # netuid -> {name, daily, hotkeys, earning}
+    per_wallet = {}   # wallet -> {daily, top_netuid, top_daily, earning}
+    idle_hotkeys = 0
+    idle_subnets = set()
+
+    for wname, stats in all_stats:
+        for s in stats.get("subnets", []):
+            if not s.get("is_registered"):
+                continue
+            netuid = s["netuid"]
+            daily = s.get("emission", 0.0) * BLOCKS_PER_DAY
+            sn = per_subnet.setdefault(
+                netuid,
+                {"name": s.get("subnet_name", f"SN{netuid}"), "daily": 0.0,
+                 "hotkeys": 0, "earning": 0},
+            )
+            sn["hotkeys"] += 1
+            sn["daily"] += daily
+            if daily > 0:
+                sn["earning"] += 1
+                w = per_wallet.setdefault(
+                    wname,
+                    {"daily": 0.0, "top_netuid": netuid, "top_daily": 0.0, "earning": 0},
+                )
+                w["daily"] += daily
+                w["earning"] += 1
+                if daily > w["top_daily"]:
+                    w["top_daily"] = daily
+                    w["top_netuid"] = netuid
+            else:
+                idle_hotkeys += 1
+                idle_subnets.add(netuid)
+
+    total_daily = sum(v["daily"] for v in per_subnet.values())
+    if total_daily <= 0:
+        return
+
+    def money(x):
+        return f"${x * tao_price:,.0f}" if tao_price else ""
+
+    console.print(
+        f"\n  [bold]Where the emission comes from[/bold] "
+        f"[dim](total {total_daily:.4f} τ/day)[/dim]"
+    )
+
+    earning_subnets = sorted(
+        ((nid, v) for nid, v in per_subnet.items() if v["daily"] > 0),
+        key=lambda kv: kv[1]["daily"], reverse=True,
+    )
+    t = Table(box=None, pad_edge=False, padding=(0, 1), show_edge=False)
+    t.add_column(
+        f"By subnet (top {min(top_n, len(earning_subnets))} of {len(earning_subnets)})",
+        style="white",
+    )
+    t.add_column("τ/day", justify="right", style="magenta")
+    if tao_price:
+        t.add_column("$/day", justify="right", style="green")
+    t.add_column("share", justify="right", style="cyan")
+    t.add_column("hk", justify="right", style="dim")
+    t.add_column("τ/hk", justify="right", style="dim")
+    for netuid, v in earning_subnets[:top_n]:
+        per_hk = v["daily"] / v["earning"] if v["earning"] else 0.0
+        row = [f"SN{netuid} {v['name']}"[:22], f"{v['daily']:.4f}"]
+        if tao_price:
+            row.append(money(v["daily"]))
+        row += [f"{v['daily'] / total_daily * 100:.1f}%", str(v["earning"]), f"{per_hk:.4f}"]
+        t.add_row(*row)
+    rest = earning_subnets[top_n:]
+    if rest:
+        rest_daily = sum(v["daily"] for _, v in rest)
+        row = [f"others ({len(rest)})", f"{rest_daily:.4f}"]
+        if tao_price:
+            row.append(money(rest_daily))
+        row += [f"{rest_daily / total_daily * 100:.1f}%", "", ""]
+        t.add_row(*row)
+    console.print(Padding(t, (0, 0, 0, 2)))
+
+    if len(all_stats) > 1 and per_wallet:
+        earning_wallets = sorted(per_wallet.items(), key=lambda kv: kv[1]["daily"], reverse=True)
+        t = Table(box=None, pad_edge=False, padding=(0, 1), show_edge=False)
+        t.add_column(
+            f"By wallet (top {min(top_n, len(earning_wallets))} of {len(earning_wallets)})",
+            style="cyan",
+        )
+        t.add_column("τ/day", justify="right", style="magenta")
+        if tao_price:
+            t.add_column("$/day", justify="right", style="green")
+        t.add_column("share", justify="right", style="cyan")
+        t.add_column("hk", justify="right", style="dim")
+        t.add_column("mostly", style="dim")
+        for wname, v in earning_wallets[:top_n]:
+            main = per_subnet.get(v["top_netuid"], {})
+            row = [wname[:20], f"{v['daily']:.4f}"]
+            if tao_price:
+                row.append(money(v["daily"]))
+            row += [
+                f"{v['daily'] / total_daily * 100:.1f}%",
+                str(v["earning"]),
+                f"SN{v['top_netuid']} {main.get('name', '')}".strip()[:16],
+            ]
+            t.add_row(*row)
+        rest_w = earning_wallets[top_n:]
+        if rest_w:
+            rest_daily = sum(v["daily"] for _, v in rest_w)
+            row = [f"others ({len(rest_w)})", f"{rest_daily:.4f}"]
+            if tao_price:
+                row.append(money(rest_daily))
+            row += [f"{rest_daily / total_daily * 100:.1f}%", "", ""]
+            t.add_row(*row)
+        console.print(Padding(t, (0, 0, 0, 2)))
+        silent = [w for w, _ in all_stats if w not in per_wallet]
+        if silent:
+            console.print(f"  [dim]{len(silent)} wallet(s) earn nothing right now[/dim]")
+
+    if idle_hotkeys:
+        console.print(
+            f"  [dim]Idle: {idle_hotkeys} registered hotkey(s) in "
+            f"{len(idle_subnets)} subnet(s) produce no emission[/dim]"
+        )
+
+
+def display_multi_wallet_stats(
+    all_stats: list[tuple[str, dict]],
+    burn_costs: dict = None,
+    emission_top_n: int = 8,
+):
     """
     Display combined stats for multiple wallets with grand totals.
 
     burn_costs: optional {netuid: burn_cost_tao} — when given, each subnet line
     shows the current burn registration price and what re-registering all
     hotkeys there would cost now, plus a grand total of registration value.
+    emission_top_n: how many rows the emission breakdown lists per table.
     """
     grand_free = 0.0
     grand_staked = 0.0
@@ -234,6 +371,9 @@ def display_multi_wallet_stats(all_stats: list[tuple[str, dict]], burn_costs: di
                 if missing_burn:
                     console.print(f" [dim]({missing_burn} hotkeys without burn price)[/dim]", end="")
                 console.print()
+
+    if all_stats:
+        display_emission_breakdown(all_stats, tao_price=tao_price, top_n=emission_top_n)
 
 
 def display_subnet_overview(info: dict, tao_price: float = None):

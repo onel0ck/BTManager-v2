@@ -14,3 +14,5 @@ wallet:
 display:
   hide_zero_stake: true
   show_usd_prices: true
+  # rows per table in the "where the emission comes from" summary
+  emission_top_n: 8

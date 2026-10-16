@@ -24,6 +24,7 @@ python main.py
 - USD values via Binance/CoinGecko pricing
 - Per-subnet breakdown with emissions
 - Registration summary with current burn cost per subnet and total registration value
+- "Where the emission comes from" summary at the bottom: top subnets and top wallets by daily TAO, their share, and how many registered hotkeys are idle
 
 **Registration**
 - Burn-based registration to any subnet

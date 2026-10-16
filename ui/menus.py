@@ -420,7 +420,11 @@ async def handle_wallet_stats(client: SubstrateClient, config: dict):
                 print_warn(f"Burn costs unavailable: {e}")
 
     if all_stats:
-        display_multi_wallet_stats(all_stats, burn_costs=burn_costs)
+        display_multi_wallet_stats(
+            all_stats,
+            burn_costs=burn_costs,
+            emission_top_n=config.get("display", {}).get("emission_top_n", 8),
+        )
 
 
 async def _check_subnet_registrations(client: SubstrateClient, config: dict):
