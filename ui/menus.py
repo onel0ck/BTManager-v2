@@ -283,8 +283,10 @@ async def handle_check_balances(client: SubstrateClient, config: dict):
         return
 
     console.print(f"  Checking {len(addresses)} wallets...")
+    show_usd = config.get("display", {}).get("show_usd_prices", True)
+    price_task = fetch_tao_price() if show_usd else asyncio.sleep(0, result=None)
     tao_price, shared_dynamic = await asyncio.gather(
-        fetch_tao_price(), client.get_all_dynamic_info(), return_exceptions=True
+        price_task, client.get_all_dynamic_info(), return_exceptions=True
     )
     if isinstance(tao_price, Exception):
         tao_price = None

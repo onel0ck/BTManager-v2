@@ -7,12 +7,9 @@ fallback_endpoints:
 
 # Wallet settings
 wallet:
-  base_path: "~/.bittensor/wallets"
-  default_coldkey: ""
+  base_path: "~/.bittensor/wallets"   # where coldkeys and hotkeys live
 
 # Display settings
 display:
-  hide_zero_stake: true
-  show_usd_prices: true
-  # rows per table in the "where the emission comes from" summary
-  emission_top_n: 8
+  show_usd_prices: true   # fetch TAO/USD and show USD columns
+  emission_top_n: 8       # rows per table in the emission summary
